@@ -1,0 +1,109 @@
+{
+  "manifest_version": 3,
+  "name": "Громкость по вкладкам",
+  "version": "5.1.0",
+  "description": "Управление громкостью звука отдельных вкладок до 500%",
+  "icons": {
+    "16": "icons/app-icon-16.png",
+    "32": "icons/app-icon-32.png",
+    "48": "icons/app-icon-48.png",
+    "128": "icons/app-icon-128.png",
+    "512": "icons/app-icon.png"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "shared/protocol.js",
+      "background.js"
+    ]
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/app-icon-16.png",
+      "32": "icons/app-icon-32.png",
+      "48": "icons/app-icon-48.png",
+      "128": "icons/app-icon-128.png",
+      "512": "icons/app-icon.png"
+    },
+    "default_title": "Громкость по вкладкам",
+    "default_popup": "popup/popup.html"
+  },
+  "commands": {
+    "volume-up": {
+      "suggested_key": {
+        "default": "Alt+Shift+Up"
+      },
+      "description": "Увеличить громкость активной вкладки"
+    },
+    "volume-down": {
+      "suggested_key": {
+        "default": "Alt+Shift+Down"
+      },
+      "description": "Уменьшить громкость активной вкладки"
+    },
+    "volume-reset": {
+      "suggested_key": {
+        "default": "Alt+Shift+R"
+      },
+      "description": "Сбросить громкость активной вкладки"
+    },
+    "toggle-mute": {
+      "suggested_key": {
+        "default": "Alt+Shift+M"
+      },
+      "description": "Включить или выключить звук активной вкладки"
+    },
+    "toggle-compressor": {
+      "suggested_key": {
+        "default": "Alt+Shift+C"
+      },
+      "description": "Включить или выключить компрессор на активной вкладке"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "shared/protocol.js",
+        "content_scripts/utils/constants.js",
+        "content_scripts/utils/logger.js",
+        "content_scripts/core/state.js",
+        "content_scripts/core/element_state.js",
+        "content_scripts/sync/storage_sync.js",
+        "content_scripts/core/audio_context.js",
+        "content_scripts/core/source_capture.js",
+        "content_scripts/core/audio_pipeline.js",
+        "content_scripts/core/volume_controller.js",
+        "content_scripts/sync/volume_sync.js",
+        "content_scripts/detection/media_detector.js",
+        "content_scripts/features/compressor.js",
+        "content_scripts/main.js",
+        "content_scripts/volume_manager.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "@per-tab-volume-control-release-ru",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  }
+}

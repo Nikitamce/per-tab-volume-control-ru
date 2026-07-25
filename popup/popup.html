@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="popup.css">
+  <title>Управление громкостью</title>
+</head>
+<body>
+  <section id="main-view" class="popup-view active" aria-hidden="false">
+    <!-- Header Section -->
+    <div class="header">
+      <p><b>Громкость по вкладкам</b></p>
+      <p>(до 500%)</p>
+      <div class="theme-toggle">
+        <button id="theme-button" class="icon-button toolbar-icon-button" data-global-control="true" title="Переключить светлую/тёмную тему" type="button">
+          <img src="../icons/dark-mode.png" alt="Переключить тему" class="theme-icon">
+        </button>
+      </div>
+    </div>
+    <!-- End Header Section -->
+
+    <!-- Volume Control Section -->
+    <div class="volume-container">
+      <div class="slider-section">
+        <div class="slider-wrapper">
+          <div class="slider-progress"></div>
+          <div class="slider-ticks" aria-hidden="true">
+            <span class="slider-tick" style="left: 22%;"></span>
+            <span class="slider-tick" style="left: 41%;"></span>
+            <span class="slider-tick" style="left: 59%;"></span>
+            <span class="slider-tick" style="left: 78%;"></span>
+          </div>
+          <input type="range" id="slider" min="0" max="500" value="100" aria-label="Ползунок громкости">
+        </div>
+        <div class="slider-labels" aria-hidden="true">
+          <span class="slider-label" data-value="0">0</span>
+          <span class="slider-label" data-value="100">100</span>
+          <span class="slider-label" data-value="200">200</span>
+          <span class="slider-label" data-value="300">300</span>
+          <span class="slider-label" data-value="400">400</span>
+          <span class="slider-label" data-value="500">500</span>
+        </div>
+      </div>
+      <div class="volume-controls-group">
+        <div class="volume-input-container">
+          <input type="number" class="volume-input" min="0" max="500" value="100" aria-label="Громкость в процентах">
+          <div class="percent-symbol" aria-hidden="true">%</div>
+        </div>
+        <div class="volume-buttons">
+          <button class="volume-button" data-action="increment" aria-label="Увеличить громкость" type="button">+</button>
+          <button class="volume-button" data-action="decrement" aria-label="Уменьшить громкость" type="button">-</button>
+        </div>
+      </div>
+    </div>
+    <button id="reset-volume" class="reset-button" type="button">Сбросить громкость</button>
+    <div class="audio-settings-row" id="audio-settings-row">
+      <label class="compact-check audio-settings-mono" id="mono-toggle-label" for="mono-toggle">
+        <span class="audio-settings-label-group">
+          <span class="audio-settings-label">Моно</span>
+         
+        </span>
+        <input type="checkbox" id="mono-toggle">
+         <span id="mono-global-hint" class="setting-hint control-lock-hint" hidden aria-hidden="true" title="Глобальный монозвук включён в настройках. Измените его там, чтобы обновить эту вкладку.">i</span>
+      </label>
+      <label class="compact-check audio-settings-mute" id="mute-toggle-label" for="mute-toggle">
+        <span class="audio-settings-label-group">
+          <span class="audio-settings-label">Без звука</span>
+        </span>
+        <input type="checkbox" id="mute-toggle" aria-label="Отключить звук текущей вкладки">
+      </label>
+      <div class="balance-control-group">
+        <label for="balance-slider" class="balance-label" id="balance-label">Баланс</label>
+        <div class="balance-slider-shell">
+          <span class="balance-marker">Л</span>
+          <div class="balance-slider-track">
+            <span class="balance-centre-line" aria-hidden="true"></span>
+            <input type="range" class="balance-slider" id="balance-slider" min="-100" max="100" value="0" step="1" aria-label="Баланс">
+          </div>
+          <span class="balance-marker">П</span>
+        </div>
+      </div>
+    </div>
+    <div id="audio-settings-note" class="audio-settings-note" hidden></div>
+    <div class="audio-controls-separator" aria-hidden="true"></div>
+    <!-- End Volume Control Section -->
+
+    <!-- Panel Tab Navigation -->
+    <div class="panel-tabs-container">
+      <div class="panel-tabs" role="tablist">
+        <button class="panel-tab-btn active" id="tab-compressor" data-tab="compressor" role="tab" aria-selected="true" aria-controls="compressor-panel" type="button">
+          <span class="panel-tab-icon">🎛️</span>
+          <span class="panel-tab-label">Компрессор</span>
+        </button>
+        <button class="panel-tab-btn" id="tab-other-tabs" data-tab="other-tabs" role="tab" aria-selected="false" aria-controls="other-tabs-panel" type="button">
+          <span class="panel-tab-icon">🔊</span>
+          <span class="panel-tab-label">Другие вкладки</span>
+          <span class="panel-tab-badge" id="other-tabs-badge"></span>
+        </button>
+      </div>
+
+      <!-- Compressor Panel -->
+      <div class="panel-content active compression-container" id="compressor-panel" role="tabpanel" aria-labelledby="tab-compressor">
+        <div class="compression-header">
+          <div class="compression-label-group" id="compression-label-group">
+            <label for="compression-toggle" class="compression-label">Включить компрессор</label>
+            <span id="compression-global-hint" class="setting-hint control-lock-hint" hidden aria-hidden="true" title="Глобальный компрессор включён в настройках. Отключите его там, чтобы менять настройки этой вкладки.">i</span>
+          </div>
+          <label id="compression-toggle-shell" class="switch" title="Включить или выключить компрессор">
+            <input type="checkbox" id="compression-toggle">
+            <span class="toggle-slider round"></span>
+          </label>
+        </div>
+        <div class="compression-params hidden" id="compression-params-container">
+          <div class="param-control">
+            <label for="compression-threshold" title="Порог: уровень в дБ, с которого начинается сжатие. Более низкие значения сжимают большую часть звука, более высокие — только громкие пики.">Порог: <span id="threshold-value">-24</span> дБ</label>
+            <input type="range" id="compression-threshold" min="-50" max="-10" value="-24" step="1" aria-label="Порог компрессора">
+          </div>
+          <div class="param-control">
+            <label for="compression-ratio" title="Степень: насколько сильно снижаются громкие пики после пересечения порога.">Степень: <span id="ratio-value">4</span>:1</label>
+            <input type="range" id="compression-ratio" min="2" max="12" value="4" step="1" aria-label="Степень сжатия компрессора">
+          </div>
+        </div>
+        <button id="reset-compressor" class="reset-button panel-reset-btn" type="button">Сбросить компрессор</button>
+      </div>
+
+      <!-- Other Tabs Panel -->
+      <div class="panel-content" id="other-tabs-panel" role="tabpanel" aria-labelledby="tab-other-tabs" aria-hidden="true">
+        <div class="other-tabs-list" id="other-tabs-list">
+          <!-- Tab items will be dynamically inserted here -->
+          <div class="other-tabs-empty" id="other-tabs-empty">
+            Других вкладок со звуком не найдено
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- End Panel Tabs -->
+
+    <!-- Footer / Status Section -->
+    <footer class="footer-bar">
+      <div class="separator"></div>
+      <div class="footer-actions">
+        <div id="connection-status" class="connection-status" aria-live="polite" aria-atomic="true">
+          <span class="status-indicator" aria-hidden="true"></span>
+          <span class="status-text">Проверка...</span>
+          <div class="tooltip" data-tooltip="Нажмите, чтобы переподключиться" role="tooltip"></div>
+        </div>
+        <button id="settings-button" class="icon-button toolbar-icon-button footer-settings-button" data-global-control="true" title="Открыть настройки" aria-label="Открыть настройки" type="button">
+          <img src="../icons/settings.png" alt="" class="settings-icon" aria-hidden="true">
+        </button>
+      </div>
+    </footer>
+    <!-- End Footer / Status Section -->
+  </section>
+
+  <section id="settings-view" class="popup-view" aria-hidden="true">
+    <div class="view-header">
+      <button id="settings-back-button" class="icon-button toolbar-icon-button view-back-button" data-global-control="true" title="Назад к основным элементам управления" aria-label="Назад к основным элементам управления" type="button">
+        <svg class="icon-chevron" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+          <path d="M11.75 4.5 6.25 10l5.5 5.5"></path>
+        </svg>
+      </button>
+      <p class="view-title">Настройки</p>
+      <span class="view-header-spacer" aria-hidden="true"></span>
+    </div>
+
+    <div class="settings-groups">
+      <section class="settings-group">
+        <p class="settings-group-title">Ярлыки</p>
+        <button id="open-shortcuts-button" class="settings-link-row" data-global-control="true" type="button">
+          <span class="settings-row-copy">
+            <span class="settings-row-label">Горячие клавиши</span>
+            <span class="settings-row-subtitle">(назначения Firefox)</span>
+          </span>
+          <svg class="settings-link-arrow" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+            <path d="M7 4.5 12.5 10 7 15.5"></path>
+          </svg>
+        </button>
+      </section>
+
+      <section class="settings-group">
+        <p class="settings-group-title">Глобальные настройки</p>
+
+        <div class="settings-row settings-row-with-switch">
+          <span class="settings-row-copy">
+            <span class="settings-row-label">Включить расширение</span>
+            <span class="settings-row-subtitle">(отключить глобальное управление звуком, не удаляя сохранённые настройки вкладок)</span>
+          </span>
+          <label class="switch settings-switch" for="settings-extension-enabled-toggle" title="Включить или выключить управление звуком расширением">
+            <input type="checkbox" id="settings-extension-enabled-toggle" data-global-control="true">
+            <span class="toggle-slider round"></span>
+          </label>
+        </div>
+
+        <label class="settings-row">
+          <span class="settings-row-copy">
+            <span class="settings-row-label">Глобальный компрессор</span>
+            <span class="settings-row-subtitle">(только новые страницы и после перезагрузки)</span>
+          </span>
+          <input type="checkbox" id="settings-default-compression-toggle" data-global-control="true">
+        </label>
+
+        <label class="settings-row">
+          <span class="settings-row-copy">
+            <span class="settings-row-label">Глобальный монозвук</span>
+            <span class="settings-row-subtitle">(только новые страницы и после перезагрузки)</span>
+          </span>
+          <input type="checkbox" id="settings-default-mono-toggle" data-global-control="true">
+        </label>
+
+        <div class="settings-slider-row settings-balance-default-row">
+          <label class="settings-row settings-inline-toggle">
+            <span class="settings-row-copy">
+              <span class="settings-row-label">Глобальный баланс Л/П</span>
+                <span class="settings-row-subtitle">(применяется сразу к открытым вкладкам и новым страницам, пока включено)</span>
+            </span>
+            <input type="checkbox" id="settings-default-balance-toggle" data-global-control="true">
+          </label>
+
+          <div class="settings-slider-content" id="settings-default-balance-content">
+            <div class="settings-slider-header">
+              <span id="settings-default-balance-value" class="settings-slider-value">Центр</span>
+            </div>
+            <div class="settings-balance-shell">
+              <span class="balance-marker settings-balance-marker">Л</span>
+              <div class="balance-slider-track">
+                <span class="balance-centre-line" aria-hidden="true"></span>
+                <input type="range" class="balance-slider settings-balance-slider" id="settings-default-balance-slider" min="-100" max="100" value="0" step="1" aria-label="Глобальный баланс для открытых и будущих вкладок" data-global-control="true">
+              </div>
+              <span class="balance-marker settings-balance-marker">П</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <section id="shortcuts-view" class="popup-view" aria-hidden="true">
+    <div class="view-header">
+      <button id="shortcuts-back-button" class="icon-button toolbar-icon-button view-back-button" data-global-control="true" title="Назад к настройкам" aria-label="Назад к настройкам" type="button">
+        <svg class="icon-chevron" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+          <path d="M11.75 4.5 6.25 10l5.5 5.5"></path>
+        </svg>
+      </button>
+      <p class="view-title">Горячие клавиши</p>
+      <span class="view-header-spacer" aria-hidden="true"></span>
+    </div>
+
+    <div id="shortcuts-list" class="shortcuts-list"></div>
+  </section>
+
+  <script src="../shared/protocol.js"></script>
+  <script src="modules/constants.js"></script>
+  <script src="modules/theme_manager.js"></script>
+  <script src="modules/ui_manager.js"></script>
+  <script src="modules/panel_tab_manager.js"></script>
+  <script src="modules/other_tabs_manager.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

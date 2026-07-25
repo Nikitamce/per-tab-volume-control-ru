@@ -1,0 +1,14 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.log
+
+# Signing leftovers (do not ship broken signatures)
+META-INF/
+
+# Local rebuild artifacts
+*.zip
+!dist/*.xpi
