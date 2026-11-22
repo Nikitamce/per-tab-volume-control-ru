@@ -126,9 +126,13 @@ window.VolumeControl.SourceCapture = {};
             };
         }
 
-        // Check if same origin
-        const pageOrigin = window.location.origin;
-        const isSameOrigin = mediaSrc.startsWith(pageOrigin);
+        // Check if same origin (parse as URL so site.com.evil.net cannot prefix-match)
+        let isSameOrigin = false;
+        try {
+            isSameOrigin = new URL(mediaSrc, window.location.href).origin === window.location.origin;
+        } catch {
+            isSameOrigin = false;
+        }
         if (isSameOrigin) {
             verbose(`[SourceCapture] ${elementInfo}: Same origin - CORS allowed`);
             return {

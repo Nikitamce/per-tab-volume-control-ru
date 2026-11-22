@@ -7,7 +7,13 @@ window.VolumeControl.MediaDetector = {};
 
 (function() {
     const { log, error, verbose, decision, traceEnter, traceExit } = window.VolumeControl;
-    const { MUTATION_SCAN_DELAY_MS } = window.VolumeControl;
+    const {
+        MUTATION_SCAN_DELAY_MS,
+        MUTATION_MAX_WAIT_MS,
+        MUTATION_PENDING_CAP,
+        PLAY_HOOK_EVENT,
+        PERIODIC_SCAN_FORCE_EVERY_TICKS
+    } = window.VolumeControl;
 
     /**
      * MediaDetector class - manages all media detection
@@ -19,6 +25,9 @@ window.VolumeControl.MediaDetector = {};
             this.isStarted = false;
             this.pendingMutations = [];
             this.mutationDebounceTimer = null;
+            this.firstPendingAt = 0;
+            this.mutationOverflowScan = false;
+            this._emptyScanStreak = 0;
             this.startGeneration = 0;
             this.captureOptions = { capture: true, passive: true };
             this.eventDelegationHandlers = {
@@ -34,54 +43,65 @@ window.VolumeControl.MediaDetector = {};
             this.onElementDiscovered = null;
             this.onElementRemoved = null;
 
-            // Play() interception (installed once per page)
-            this._playInterceptorInstalled = false;
-            this._originalPlay = null;
+            // Listener for the MAIN-world play hook's CustomEvent (set while started)
+            this.playHookHandler = null;
+            this.playHookOptions = { passive: true };
 
-            // Periodic safety scan timer
+            // Periodic safety scan timer, plus the state that lets it skip a clean DOM
             this._periodicScanTimer = null;
+            this._scanDirty = true;
+            this._ticksSinceWalk = 0;
         }
 
         /**
-         * Install a monkey-patch on HTMLMediaElement.prototype.play
-         * to catch off-DOM media elements that the MutationObserver
-         * and event delegation cannot reach (e.g., Bandcamp-style players
-         * that create Audio elements without attaching to the DOM).
+         * Listen for the MAIN-world play hook (play_hook_main.js). It catches off-DOM media
+         * (Bandcamp-style players that call `new Audio().play()` without attaching the element)
+         * that the MutationObserver and event delegation cannot reach.
          *
-         * The patch is installed once per page and is transparent to
-         * the page's own callers — it preserves the original return
-         * value (a Promise) and does not interfere with normal playback.
-         * It also avoids re-wrapping if already installed by another
-         * instance (e.g., in a different frame within the same page).
+         * The page-owned wrapper dispatches a CustomEvent on `document` whose `detail` is the
+         * playing element. This listener only validates it and defers discovery to a microtask,
+         * so no extension work runs inside the page's own play() call. Nothing is installed on
+         * the page from this world, so no content-script function can be left behind for the
+         * page to call after the extension is updated, disabled, or reloaded.
          */
-        installPlayInterception() {
-            if (this._playInterceptorInstalled) return;
+        setupPlayHookListener() {
+            if (this.playHookHandler) return;
 
-            // If another detector instance already patched play(), just
-            // mark ourselves as aware so we don't double-wrap.
-            if (this._originalPlay === null) {
-                this._originalPlay = HTMLMediaElement.prototype.play;
-
-                // If the prototype was already replaced by another instance
-                // on this same frame, skip re-wrapping.
-                if (this._originalPlay._vcWrapped) {
-                    this._playInterceptorInstalled = true;
+            const generation = this.startGeneration;
+            this.playHookHandler = (event) => {
+                if (!this.isStarted || generation !== this.startGeneration) {
                     return;
                 }
 
-                const self = this;
-                const WrappedPlay = function() {
-                    if (self.isStarted && !self.isTracked(this)) {
-                        self.notifyDiscovered(this, 'play-interception');
-                    }
-                    return self._originalPlay.apply(this, arguments);
-                };
-                WrappedPlay._vcWrapped = true;
-                HTMLMediaElement.prototype.play = WrappedPlay;
-            }
+                let element;
+                try {
+                    element = event.detail;
+                } catch {
+                    return;
+                }
+                // Pages can dispatch this event too: only ever act on a real media element.
+                if (!(element instanceof HTMLMediaElement) || this.isTracked(element)) {
+                    return;
+                }
 
-            this._playInterceptorInstalled = true;
-            verbose('[MediaDetector] HTMLMediaElement.prototype.play interception installed');
+                Promise.resolve().then(() => {
+                    if (this.isStarted && generation === this.startGeneration && !this.isTracked(element)) {
+                        this.notifyDiscovered(element, 'play-interception');
+                    }
+                }).catch((err) => {
+                    verbose('[MediaDetector] play-interception discovery failed:', err);
+                });
+            };
+
+            document.addEventListener(PLAY_HOOK_EVENT, this.playHookHandler, this.playHookOptions);
+            verbose('[MediaDetector] Play hook listener set up');
+        }
+
+        teardownPlayHookListener() {
+            if (!this.playHookHandler) return;
+
+            document.removeEventListener(PLAY_HOOK_EVENT, this.playHookHandler, this.playHookOptions);
+            this.playHookHandler = null;
         }
 
         /**
@@ -99,8 +119,8 @@ window.VolumeControl.MediaDetector = {};
             
             log('[MediaDetector] Starting detection');
             
-            // 0. Install play() interception (catches off-DOM elements)
-            this.installPlayInterception();
+            // 0. Listen for the MAIN-world play hook (catches off-DOM elements)
+            this.setupPlayHookListener();
             
             // 1. Initial scan
             this.scanDocument();
@@ -136,13 +156,16 @@ window.VolumeControl.MediaDetector = {};
             }
 
             this.pendingMutations = [];
+            this.firstPendingAt = 0;
+            this.mutationOverflowScan = false;
             this.teardownEventDelegation();
+            this.teardownPlayHookListener();
             this.onElementDiscovered = null;
             this.onElementRemoved = null;
             
             // Clear periodic scan timer
             if (this._periodicScanTimer) {
-                clearInterval(this._periodicScanTimer);
+                clearTimeout(this._periodicScanTimer);
                 this._periodicScanTimer = null;
             }
             
@@ -188,26 +211,12 @@ window.VolumeControl.MediaDetector = {};
                 error('[MediaDetector] Error querying media elements:', e);
             }
             
-            // Scan shadow DOMs using TreeWalker for efficiency
+            // Scan shadow DOMs with a TreeWalker. It deliberately has no JS filter: a filter
+            // object makes the engine call back into script for every element in the document,
+            // which freezes the main thread for 100+ ms on pages with tens of thousands of nodes.
+            // The loop below does the same shadowRoot check natively.
             try {
-                const walker = document.createTreeWalker(
-                    root,
-                    NodeFilter.SHOW_ELEMENT,
-                    {
-                        acceptNode: (node) => {
-                            // Skip media elements (already found)
-                            if (node instanceof HTMLMediaElement) {
-                                return NodeFilter.FILTER_REJECT;
-                            }
-                            // Accept elements with shadow roots
-                            if (node.shadowRoot) {
-                                return NodeFilter.FILTER_ACCEPT;
-                            }
-                            // Skip to children
-                            return NodeFilter.FILTER_SKIP;
-                        }
-                    }
-                );
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null);
                 
                 let node;
                 while ((node = walker.nextNode())) {
@@ -259,10 +268,27 @@ window.VolumeControl.MediaDetector = {};
         }
 
         /**
+         * Remember that the DOM changed in a way that could expose new media, so the next
+         * periodic safety scan walks the document. Removal-only records cannot add media.
+         * @param {MutationRecord[]} mutations
+         */
+        _noteRelevantMutations(mutations) {
+            if (this._scanDirty) return;
+            for (const mutation of mutations) {
+                if (mutation.type === 'attributes' || (mutation.addedNodes && mutation.addedNodes.length > 0)) {
+                    this._scanDirty = true;
+                    return;
+                }
+            }
+        }
+
+        /**
          * Handle mutation records with debouncing
          * @param {MutationRecord[]} mutations
          */
         handleMutations(mutations) {
+            this._noteRelevantMutations(mutations);
+
             // Fast-path direct media additions to avoid debounce lag.
             const directMediaMutations = mutations.filter(m =>
                 m.type === 'childList' &&
@@ -283,16 +309,46 @@ window.VolumeControl.MediaDetector = {};
             if (remainingMutations.length === 0) return;
             
             this.pendingMutations.push(...remainingMutations);
-            
-            // Debounce processing
+            if (!this.firstPendingAt) {
+                this.firstPendingAt = Date.now();
+            }
+
+            const pendingCap = MUTATION_PENDING_CAP || 500;
+            if (this.pendingMutations.length > pendingCap) {
+                this.pendingMutations.length = pendingCap;
+                this.mutationOverflowScan = true;
+            }
+
+            const maxWaitMs = MUTATION_MAX_WAIT_MS || 1000;
+            if (Date.now() - this.firstPendingAt >= maxWaitMs) {
+                this.flushPendingMutations();
+                return;
+            }
+
             if (this.mutationDebounceTimer) {
                 clearTimeout(this.mutationDebounceTimer);
             }
-            
             this.mutationDebounceTimer = setTimeout(() => {
-                this.processMutations(this.pendingMutations);
-                this.pendingMutations = [];
+                this.flushPendingMutations();
             }, MUTATION_SCAN_DELAY_MS || 250);
+        }
+
+        flushPendingMutations() {
+            if (this.mutationDebounceTimer) {
+                clearTimeout(this.mutationDebounceTimer);
+                this.mutationDebounceTimer = null;
+            }
+            const batch = this.pendingMutations;
+            this.pendingMutations = [];
+            this.firstPendingAt = 0;
+            const overflow = this.mutationOverflowScan;
+            this.mutationOverflowScan = false;
+            if (batch.length > 0) {
+                this.processMutations(batch);
+            }
+            if (overflow) {
+                this.scanDocument();
+            }
         }
 
         /**
@@ -386,24 +442,59 @@ window.VolumeControl.MediaDetector = {};
          * Each scan only reports elements that are NOT yet tracked, so
          * repeated scans are lightweight.
          *
+         * Walking a large document is the expensive part, so a tick only
+         * walks when the MutationObserver recorded a relevant change since
+         * the last walk, or when PERIODIC_SCAN_FORCE_EVERY_TICKS ticks have
+         * passed (some changes, such as attaching a shadow root to an
+         * existing element, produce no observed mutation). A skipped tick
+         * counts as an empty scan for the backoff.
+         *
          * @param {number} intervalMs - Scan interval in milliseconds
          */
         startPeriodicScan(intervalMs = 5000) {
             if (this._periodicScanTimer) {
-                clearInterval(this._periodicScanTimer);
+                clearTimeout(this._periodicScanTimer);
+                this._periodicScanTimer = null;
             }
 
             const generation = this.startGeneration;
-            this._periodicScanTimer = setInterval(() => {
+            const activeIntervalMs = intervalMs || 5000;
+            const backoffMs = 15000;
+            const forceEveryTicks = PERIODIC_SCAN_FORCE_EVERY_TICKS || 4;
+            this._emptyScanStreak = 0;
+            this._scanDirty = true;
+            this._ticksSinceWalk = 0;
+
+            const tick = () => {
                 if (!this.isStarted || generation !== this.startGeneration) {
-                    clearInterval(this._periodicScanTimer);
                     this._periodicScanTimer = null;
                     return;
                 }
-                this.scanDocument();
-            }, intervalMs);
 
-            verbose(`[MediaDetector] Periodic safety scan started (every ${intervalMs}ms)`);
+                if (!document.hidden) {
+                    this._ticksSinceWalk += 1;
+                    if (this._scanDirty || this._ticksSinceWalk >= forceEveryTicks) {
+                        this._scanDirty = false;
+                        this._ticksSinceWalk = 0;
+                        const mediaElements = this.findAllMediaElements(document.body);
+                        const untracked = mediaElements.filter((element) => !this.isTracked(element));
+                        if (untracked.length === 0) {
+                            this._emptyScanStreak += 1;
+                        } else {
+                            this._emptyScanStreak = 0;
+                            untracked.forEach((element) => this.notifyDiscovered(element, 'periodic-scan'));
+                        }
+                    } else {
+                        this._emptyScanStreak += 1;
+                    }
+                }
+
+                const delay = this._emptyScanStreak >= 3 ? backoffMs : activeIntervalMs;
+                this._periodicScanTimer = setTimeout(tick, delay);
+            };
+
+            this._periodicScanTimer = setTimeout(tick, activeIntervalMs);
+            verbose(`[MediaDetector] Periodic safety scan started (every ${activeIntervalMs}ms)`);
         }
 
         /**

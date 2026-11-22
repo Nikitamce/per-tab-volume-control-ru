@@ -6,6 +6,17 @@ window.Popup = window.Popup || {};
 
 window.Popup.UIManager = {
     uiElements: {},
+    lastStatusRenderArgs: null,
+    // Whether the last status render left the main controls live (false for error and checking).
+    controlsEnabled: true,
+
+    t: function(key, subs) {
+        return globalThis.VCI18n?.t?.(key, subs) ?? key;
+    },
+
+    tPlural: function(baseKey, count, subs) {
+        return globalThis.VCI18n?.tPlural?.(baseKey, count, subs) ?? `${baseKey}.other`;
+    },
 
     initializeUIElements: function() {
         this.uiElements.mainView = document.getElementById('main-view');
@@ -21,6 +32,7 @@ window.Popup.UIManager = {
         this.uiElements.volumeContainer = document.querySelector('.volume-container');
         this.uiElements.audioSettingsRow = document.getElementById('audio-settings-row');
         this.uiElements.audioSettingsNote = document.getElementById('audio-settings-note');
+        this.uiElements.compactToggle = document.getElementById('compact-toggle');
         this.uiElements.monoToggleLabel = document.getElementById('mono-toggle-label');
         this.uiElements.monoGlobalHint = document.getElementById('mono-global-hint');
         this.uiElements.monoToggle = document.getElementById('mono-toggle');
@@ -45,6 +57,7 @@ window.Popup.UIManager = {
         this.uiElements.settingsBackButton = document.getElementById('settings-back-button');
         this.uiElements.shortcutsBackButton = document.getElementById('shortcuts-back-button');
         this.uiElements.openShortcutsButton = document.getElementById('open-shortcuts-button');
+        this.uiElements.settingsLanguageSelect = document.getElementById('settings-language-select');
         this.uiElements.settingsExtensionEnabledToggle = document.getElementById('settings-extension-enabled-toggle');
         this.uiElements.settingsDefaultCompressionToggle = document.getElementById('settings-default-compression-toggle');
         this.uiElements.settingsDefaultMonoToggle = document.getElementById('settings-default-mono-toggle');
@@ -55,7 +68,6 @@ window.Popup.UIManager = {
         this.uiElements.shortcutsList = document.getElementById('shortcuts-list');
         
         this.uiElements.themeButton = document.getElementById('theme-button');
-        this.uiElements.themeIcon = document.getElementById('theme-button')?.querySelector('.theme-icon');
         this.uiElements.connectionStatusDiv = document.getElementById('connection-status');
         this.uiElements.statusIndicator = document.getElementById('connection-status')?.querySelector('.status-indicator');
         this.uiElements.statusText = document.getElementById('connection-status')?.querySelector('.status-text');
@@ -63,13 +75,40 @@ window.Popup.UIManager = {
         this.uiElements.globalControls = document.querySelectorAll('[data-global-control="true"]');
     },
 
+    populateLanguageSelect: function(preference) {
+        const select = this.uiElements.settingsLanguageSelect;
+        const i18n = globalThis.VCI18n;
+        if (!select || !i18n) {
+            return;
+        }
+
+        const preferred = preference ?? i18n.getPreference?.() ?? i18n.DEFAULT_PREF;
+        select.replaceChildren();
+
+        const autoOption = document.createElement('option');
+        autoOption.value = i18n.DEFAULT_PREF;
+        autoOption.textContent = this.t('popup.settings.language.auto');
+        select.appendChild(autoOption);
+
+        (i18n.SUPPORTED_LANGUAGES || []).forEach((entry) => {
+            const option = document.createElement('option');
+            option.value = entry.code;
+            option.textContent = entry.nativeLabel;
+            select.appendChild(option);
+        });
+
+        select.value = preferred;
+    },
+
     formatBalanceValue: function(balance) {
         const safeBalance = Number.isFinite(Number(balance)) ? Math.round(Number(balance)) : 0;
         if (safeBalance === 0) {
-            return 'Центр';
+            return this.t('popup.balance.centre');
         }
 
-        return `${safeBalance < 0 ? 'Л' : 'П'} ${Math.abs(safeBalance)}%`;
+        return safeBalance < 0
+            ? this.t('popup.balance.formatLeft', { value: Math.abs(safeBalance) })
+            : this.t('popup.balance.formatRight', { value: Math.abs(safeBalance) });
     },
 
     updateBalanceSliderUI: function(slider, balance, valueElement = null) {
@@ -134,6 +173,33 @@ window.Popup.UIManager = {
         });
     },
 
+    isCompactMode: function() {
+        return Boolean(this.uiElements.mainView?.classList.contains('compact'));
+    },
+
+    setCompactMode: function(isCompact) {
+        const compact = Boolean(isCompact);
+        this.uiElements.mainView?.classList.toggle('compact', compact);
+
+        const toggle = this.uiElements.compactToggle;
+        if (!toggle) {
+            return compact;
+        }
+
+        const titleKey = compact ? 'popup.compact.expandTitle' : 'popup.compact.collapseTitle';
+        const ariaKey = compact ? 'popup.compact.expandAria' : 'popup.compact.collapseAria';
+        const title = this.t(titleKey);
+        const ariaLabel = this.t(ariaKey);
+
+        toggle.setAttribute('aria-expanded', compact ? 'false' : 'true');
+        toggle.setAttribute('data-i18n-title', titleKey);
+        toggle.setAttribute('data-i18n-aria-label', ariaKey);
+        toggle.title = title;
+        toggle.setAttribute('aria-label', ariaLabel);
+
+        return compact;
+    },
+
     renderShortcuts: function(commands = []) {
         if (!this.uiElements.shortcutsList) {
             return;
@@ -150,11 +216,14 @@ window.Popup.UIManager = {
 
             const shortcutKey = document.createElement('span');
             shortcutKey.className = 'shortcut-key';
-            shortcutKey.textContent = command?.shortcut || 'Не назначено';
+            shortcutKey.textContent = command?.shortcut || this.t('popup.shortcuts.notAssigned');
 
             const shortcutDescription = document.createElement('p');
             shortcutDescription.className = 'shortcut-description';
-            shortcutDescription.textContent = command?.description || 'Описание недоступно.';
+            const description = command?.descriptionKey
+                ? this.t(command.descriptionKey)
+                : (command?.description || this.t('popup.shortcuts.noDescription'));
+            shortcutDescription.textContent = description;
 
             shortcutCard.append(shortcutKey, shortcutDescription);
             shortcutsFragment.appendChild(shortcutCard);
@@ -163,7 +232,7 @@ window.Popup.UIManager = {
         this.uiElements.shortcutsList.appendChild(shortcutsFragment);
     },
 
-    updateUI: function(statusObject) {
+    updateUI: function(statusObject, options = {}) {
         const Constants = window.Popup?.Constants || {};
         const Utils = window.Popup?.Utils;
         const {
@@ -180,6 +249,8 @@ window.Popup.UIManager = {
             volume = DEFAULT_VOLUME,
             status = 'inactive',
             message = "",
+            messageKey = null,
+            messageParams = null,
             extensionEnabled = true,
             muted = false,
             monoEnabled = DEFAULT_MONO_ENABLED,
@@ -191,19 +262,29 @@ window.Popup.UIManager = {
             audioSettingsReason = null,
             corsAffectedCount = 0
         } = statusObject || {};
+        const preserveVolumeControls = options.preserveVolumeControls === true;
 
         const clampedVolume = Utils 
             ? Utils.normalizeVolume(volume, DEFAULT_VOLUME)
             : Math.max(MIN_VOLUME, Math.min(MAX_VOLUME, Math.round(volume)));
-            
-        if (this.uiElements.slider) this.uiElements.slider.value = clampedVolume;
-        if (this.uiElements.volumeInput) this.uiElements.volumeInput.value = clampedVolume;
-        if (this.uiElements.sliderProgress) {
-            const progressPercent = (clampedVolume / MAX_VOLUME) * 100;
-            this.uiElements.sliderProgress.style.width = `${progressPercent}%`;
+
+        // While the volume field is focused (typed or wheel edits in flight),
+        // incoming status must not yank the controls back to the stale tab
+        // value mid-gesture. Same effect as preserveVolumeControls during drags.
+        const volumeInputFocused = Boolean(this.uiElements.volumeInput)
+            && typeof document !== 'undefined' && Boolean(document)
+            && document.activeElement === this.uiElements.volumeInput;
+
+        if (!preserveVolumeControls && !volumeInputFocused) {
+            if (this.uiElements.slider) this.uiElements.slider.value = clampedVolume;
+            if (this.uiElements.volumeInput) this.uiElements.volumeInput.value = clampedVolume;
+            if (this.uiElements.sliderProgress) {
+                const progressPercent = (clampedVolume / MAX_VOLUME) * 100;
+                this.uiElements.sliderProgress.style.width = `${progressPercent}%`;
+            }
         }
 
-    if (this.uiElements.muteToggle) this.uiElements.muteToggle.checked = Boolean(muted);
+        if (this.uiElements.muteToggle) this.uiElements.muteToggle.checked = Boolean(muted);
         if (this.uiElements.monoToggle) this.uiElements.monoToggle.checked = Boolean(monoEnabled);
         this.updateBalanceSliderUI(this.uiElements.balanceSlider, balance);
 
@@ -227,31 +308,25 @@ window.Popup.UIManager = {
             status,
             message,
             corsAffectedCount,
-            statusObject.statusDetail,
+            statusObject?.statusDetail,
             extensionEnabled,
             audioSettingsAvailable,
-            audioSettingsReason
+            audioSettingsReason,
+            messageKey,
+            messageParams
         );
-        this.updateAudioSettingsAvailabilityUI(audioSettingsAvailable, audioSettingsReason);
+        // The status render decides whether controls are live at all (an error disables them),
+        // so page capability can only narrow that, never re-enable mono and balance.
+        this.updateAudioSettingsAvailabilityUI(audioSettingsAvailable, audioSettingsReason, this.controlsEnabled !== false);
     },
 
-    updateAudioSettingsAvailabilityUI: function(available, reason = null) {
+    updateAudioSettingsAvailabilityUI: function(available, reason = null, controlsEnabled = true) {
         if (!this.uiElements.audioSettingsRow || !this.uiElements.monoToggle || !this.uiElements.balanceSlider) {
             return;
         }
 
-        const reasonText = reason === 'blocked-by-cors'
-            ? 'Моно и баланс недоступны: для этого медиа используется упрощённый режим из‑за CORS.'
-            : reason === 'native-only-current-media'
-                ? 'Моно и баланс недоступны: для этого медиа используется упрощённый режим.'
-                : reason === 'legacy-firefox-capture'
-                    ? 'Моно и баланс недоступны на устаревших путях захвата Firefox.'
-                    : reason === 'page-unavailable'
-                        ? 'Моно и баланс недоступны на этой странице.'
-                        : '';
-
-        this.uiElements.monoToggle.disabled = !available;
-        this.uiElements.balanceSlider.disabled = !available;
+        this.uiElements.monoToggle.disabled = !available || !controlsEnabled;
+        this.uiElements.balanceSlider.disabled = !available || !controlsEnabled;
         this.uiElements.audioSettingsRow.classList.toggle('audio-settings-limited', !available);
 
         if (this.uiElements.audioSettingsNote) {
@@ -260,10 +335,22 @@ window.Popup.UIManager = {
         }
     },
 
-    updateConnectionStatusUI: function(status, message = "", corsAffectedCount = 0, statusDetail = null, extensionEnabled = true, audioSettingsAvailable = true, audioSettingsReason = null) {
+    updateConnectionStatusUI: function(status, message = "", corsAffectedCount = 0, statusDetail = null, extensionEnabled = true, audioSettingsAvailable = true, audioSettingsReason = null, messageKey = null, messageParams = null) {
         if (!this.uiElements.connectionStatusDiv || !this.uiElements.statusIndicator || !this.uiElements.statusText || !this.uiElements.tooltip) {
             return;
         }
+
+        this.lastStatusRenderArgs = {
+            status,
+            message,
+            corsAffectedCount,
+            statusDetail,
+            extensionEnabled,
+            audioSettingsAvailable,
+            audioSettingsReason,
+            messageKey,
+            messageParams
+        };
 
         this.uiElements.connectionStatusDiv.classList.remove('connected', 'disconnected', 'disabled', 'warning', 'limited');
         this.uiElements.statusIndicator.style.background = '';
@@ -272,6 +359,9 @@ window.Popup.UIManager = {
         let tooltipText = "";
         let controlsEnabled = false;
         let permanentlyDisabled = false;
+        const resolvedMessage = messageKey
+            ? this.t(messageKey, messageParams || undefined)
+            : message;
         const isNativeOnlyLimited = audioSettingsAvailable === false && (
             audioSettingsReason === 'native-only-current-media' ||
             audioSettingsReason === 'blocked-by-cors'
@@ -280,88 +370,81 @@ window.Popup.UIManager = {
         switch (status) {
             case 'disabled':
                 this.uiElements.connectionStatusDiv.classList.add('disabled');
-                statusMessage = 'Отключено вручную';
+                statusMessage = this.t('status.disabled');
                 tooltipText = extensionEnabled === false
-                    ? 'Управление звуком расширением отключено глобально. Сохранённые настройки вкладок не удалены.'
-                    : 'Управление звуком расширением отключено для этой вкладки.';
+                    ? this.t('status.disabled.tooltipGlobal')
+                    : this.t('status.disabled.tooltipTab');
                 controlsEnabled = true;
                 break;
             case 'active':
                 if (statusDetail === 'setting-up') {
                     this.uiElements.connectionStatusDiv.classList.add('connected');
-                    statusMessage = 'Подключение...';
-                    tooltipText = 'Настройка управления звуком для медиа на этой странице';
+                    statusMessage = this.t('status.connecting');
+                    tooltipText = this.t('status.connecting.tooltipSetup');
                 } else if (statusDetail === 'connecting') {
                     this.uiElements.connectionStatusDiv.classList.add('connected');
-                    statusMessage = 'Подключение...';
-                    tooltipText = 'Поиск воспроизводимого медиа на этой странице';
+                    statusMessage = this.t('status.connecting');
+                    tooltipText = this.t('status.connecting.tooltipDetecting');
                 } else if (isNativeOnlyLimited) {
                     this.uiElements.connectionStatusDiv.classList.add('limited');
-                    statusMessage = 'Подключено [ограничено]';
-                    tooltipText = 'Подключено. Для этого медиа используется упрощённый режим: компрессор, моно и баланс недоступны. Громкость и беззвучный режим работают через плеер.';
+                    statusMessage = this.t('status.connectedLimited');
+                    tooltipText = this.t('status.connectedLimited.tooltip');
                 } else {
                     this.uiElements.connectionStatusDiv.classList.add('connected');
-                    statusMessage = 'Подключено';
+                    statusMessage = this.t('status.connected');
 
                     if (corsAffectedCount > 0) {
-                        const elementWord = corsAffectedCount === 1
-                            ? 'элемент использует'
-                            : (corsAffectedCount >= 2 && corsAffectedCount <= 4)
-                                ? 'элемента используют'
-                                : 'элементов используют';
-                        tooltipText = `Управление звуком на этой странице.\n\nПримечание: ${corsAffectedCount} ${elementWord} упрощённый режим, потому что расширенная обработка недоступна.`;
+                        tooltipText = this.tPlural('status.connected.corsNote', corsAffectedCount, {
+                            count: corsAffectedCount
+                        });
                     } else {
-                        tooltipText = 'Управление звуком на этой странице';
+                        tooltipText = this.t('status.connected.tooltip');
                     }
                 }
 
                 controlsEnabled = true;
                 break;
             case 'inactive':
-                // Media exists but not actively controlled
                 this.uiElements.connectionStatusDiv.classList.add('disconnected');
                 this.uiElements.statusIndicator.style.background = 'var(--warning)';
 
                 if (statusDetail === 'paused') {
-                    statusMessage = "Медиа на паузе";
-                    tooltipText = "Медиа обнаружено, но не воспроизводится. Запустите воспроизведение, чтобы управлять громкостью.";
+                    statusMessage = this.t('status.mediaPaused');
+                    tooltipText = this.t('status.mediaPaused.tooltip');
                 } else if (statusDetail === 'error') {
-                    statusMessage = "Ошибка настройки";
-                    tooltipText = "Медиа обнаружено, но настройка не удалась. Попробуйте обновить страницу.";
+                    statusMessage = this.t('status.setupError');
+                    tooltipText = this.t('status.setupError.tooltip');
                 } else if (statusDetail === 'detecting') {
-                    statusMessage = "Обнаружение...";
-                    tooltipText = "Медиа обнаружено, ожидание начала воспроизведения.";
+                    statusMessage = this.t('status.detecting');
+                    tooltipText = this.t('status.detecting.tooltip');
                 } else if (statusDetail === 'no-source') {
-                    statusMessage = "Нет источника";
-                    tooltipText = "Элементы медиа найдены, но источник аудио/видео не загружен.";
+                    statusMessage = this.t('status.noSource');
+                    tooltipText = this.t('status.noSource.tooltip');
                 } else {
-                    statusMessage = "Ожидание...";
-                    tooltipText = "Медиа обнаружено, ожидание подключения. Попробуйте запустить воспроизведение.";
+                    statusMessage = this.t('status.waiting');
+                    tooltipText = this.t('status.waiting.tooltip');
                 }
-                // Enable controls even when inactive - user can still set desired volume
                 controlsEnabled = true;
                 break;
             case 'no-media':
                 this.uiElements.connectionStatusDiv.classList.add('disconnected');
                 this.uiElements.statusIndicator.style.background = 'var(--border)';
-                statusMessage = "Медиа не найдено";
-                tooltipText = "На этой странице не обнаружено HTML5 audio/video";
-                // Enable controls - volume will be applied when media appears
+                statusMessage = this.t('status.noMedia');
+                tooltipText = this.t('status.noMedia.tooltip');
                 controlsEnabled = true;
                 break;
             case 'error':
                 this.uiElements.connectionStatusDiv.classList.add('disconnected');
-                statusMessage = "Отключено";
-                tooltipText = message || "Ошибка связи со страницей.";
-                permanentlyDisabled = message.includes("Нельзя обнаружить/управлять звуком на этой странице")
-                    || message.includes("Cannot detect/control audio on this page");
+                statusMessage = this.t('status.disconnected');
+                tooltipText = resolvedMessage || this.t('status.disconnected.tooltipFallback');
+                permanentlyDisabled = messageKey === 'error.pageUnsupported';
                 controlsEnabled = false;
                 break;
             default:
                 this.uiElements.connectionStatusDiv.classList.add('disconnected');
                 this.uiElements.statusIndicator.style.background = 'var(--border)';
-                statusMessage = "Проверка...";
-                tooltipText = "Попытка подключения к странице...";
+                statusMessage = this.t('status.checking');
+                tooltipText = this.t('status.checking.tooltip');
                 controlsEnabled = false;
                 break;
         }
@@ -369,11 +452,47 @@ window.Popup.UIManager = {
         this.uiElements.statusText.textContent = statusMessage;
         this.uiElements.tooltip.setAttribute('data-tooltip', tooltipText);
 
+        this.controlsEnabled = controlsEnabled;
         if (controlsEnabled) {
             this.enableControls();
         } else {
             this.disableControls(permanentlyDisabled);
         }
+    },
+
+    refreshLocalizedDynamicText: function() {
+        if (this.lastStatusRenderArgs) {
+            const args = this.lastStatusRenderArgs;
+            this.updateConnectionStatusUI(
+                args.status,
+                args.message,
+                args.corsAffectedCount,
+                args.statusDetail,
+                args.extensionEnabled,
+                args.audioSettingsAvailable,
+                args.audioSettingsReason,
+                args.messageKey,
+                args.messageParams
+            );
+        }
+
+        if (this.uiElements.settingsDefaultBalanceSlider && this.uiElements.settingsDefaultBalanceValue) {
+            this.updateBalanceSliderUI(
+                this.uiElements.settingsDefaultBalanceSlider,
+                this.uiElements.settingsDefaultBalanceSlider.value,
+                this.uiElements.settingsDefaultBalanceValue
+            );
+        }
+
+        if (this.uiElements.balanceSlider) {
+            this.updateBalanceSliderUI(
+                this.uiElements.balanceSlider,
+                this.uiElements.balanceSlider.value
+            );
+        }
+
+        this.setCompactMode(this.isCompactMode());
+        this.populateLanguageSelect(globalThis.VCI18n?.getPreference?.());
     },
 
     disableControls: function(permanently = false) {
@@ -394,12 +513,26 @@ window.Popup.UIManager = {
             if (permanently) {
                 this.uiElements.connectionStatusDiv.style.cursor = 'not-allowed';
                 this.uiElements.connectionStatusDiv.onclick = null;
+                this.uiElements.connectionStatusDiv.onkeydown = null;
+                this.uiElements.connectionStatusDiv.removeAttribute?.('role');
+                this.uiElements.connectionStatusDiv.removeAttribute?.('tabindex');
+                this.uiElements.connectionStatusDiv.removeAttribute?.('aria-label');
             } else {
                 this.uiElements.connectionStatusDiv.style.cursor = 'pointer';
-                // handleRetryConnection needs to be passed or assigned later
-                // For now, we'll assume the controller assigns it or we dispatch an event
+                this.uiElements.connectionStatusDiv.tabIndex = 0;
+                this.uiElements.connectionStatusDiv.setAttribute?.('role', 'button');
+                this.uiElements.connectionStatusDiv.setAttribute?.(
+                    'aria-label',
+                    (window.VCI18n?.t?.('popup.status.reconnectTooltip')) || 'Click to reconnect'
+                );
                 this.uiElements.connectionStatusDiv.onclick = () => {
                     document.dispatchEvent(new CustomEvent('retry-connection'));
+                };
+                this.uiElements.connectionStatusDiv.onkeydown = (event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        document.dispatchEvent(new CustomEvent('retry-connection'));
+                    }
                 };
             }
         }
@@ -422,6 +555,10 @@ window.Popup.UIManager = {
         if (this.uiElements.connectionStatusDiv) {
             this.uiElements.connectionStatusDiv.style.cursor = 'help';
             this.uiElements.connectionStatusDiv.onclick = null;
+            this.uiElements.connectionStatusDiv.onkeydown = null;
+            this.uiElements.connectionStatusDiv.removeAttribute?.('role');
+            this.uiElements.connectionStatusDiv.removeAttribute?.('tabindex');
+            this.uiElements.connectionStatusDiv.removeAttribute?.('aria-label');
         }
     }
 };

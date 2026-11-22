@@ -1,20 +1,20 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="popup.css">
-  <title>Управление громкостью</title>
+  <title data-i18n="popup.documentTitle">Volume Control</title>
 </head>
-<body>
+<body class="i18n-pending">
   <section id="main-view" class="popup-view active" aria-hidden="false">
     <!-- Header Section -->
     <div class="header">
-      <p><b>Громкость по вкладкам</b></p>
-      <p>(до 500%)</p>
+      <p><b>Per-Tab Volume Control</b></p>
+      <p data-i18n="popup.header.subtitle">(up to 500%)</p>
       <div class="theme-toggle">
-        <button id="theme-button" class="icon-button toolbar-icon-button" data-global-control="true" title="Переключить светлую/тёмную тему" type="button">
-          <img src="../icons/dark-mode.png" alt="Переключить тему" class="theme-icon">
+        <button id="theme-button" class="icon-button toolbar-icon-button" data-global-control="true" title="Switch light/dark mode" data-i18n-title="popup.theme.toggleTitle" type="button">
+          <img src="../icons/dark-mode.png" alt="Switch theme" data-i18n-alt="popup.theme.alt" class="theme-icon">
         </button>
       </div>
     </div>
@@ -31,7 +31,7 @@
             <span class="slider-tick" style="left: 59%;"></span>
             <span class="slider-tick" style="left: 78%;"></span>
           </div>
-          <input type="range" id="slider" min="0" max="500" value="100" aria-label="Ползунок громкости">
+          <input type="range" id="slider" min="0" max="500" value="100" aria-label="Volume slider" data-i18n-aria-label="popup.volume.sliderAria">
         </div>
         <div class="slider-labels" aria-hidden="true">
           <span class="slider-label" data-value="0">0</span>
@@ -44,45 +44,57 @@
       </div>
       <div class="volume-controls-group">
         <div class="volume-input-container">
-          <input type="number" class="volume-input" min="0" max="500" value="100" aria-label="Громкость в процентах">
+          <input type="number" class="volume-input" min="0" max="500" step="1" value="100" aria-label="Volume percentage" data-i18n-aria-label="popup.volume.inputAria">
           <div class="percent-symbol" aria-hidden="true">%</div>
         </div>
         <div class="volume-buttons">
-          <button class="volume-button" data-action="increment" aria-label="Увеличить громкость" type="button">+</button>
-          <button class="volume-button" data-action="decrement" aria-label="Уменьшить громкость" type="button">-</button>
+          <button class="volume-button" data-action="increment" aria-label="Increase volume" data-i18n-aria-label="popup.volume.increaseAria" type="button">+</button>
+          <button class="volume-button" data-action="decrement" aria-label="Decrease volume" data-i18n-aria-label="popup.volume.decreaseAria" type="button">-</button>
         </div>
       </div>
     </div>
-    <button id="reset-volume" class="reset-button" type="button">Сбросить громкость</button>
+    <button id="reset-volume" class="reset-button" type="button" data-i18n="popup.volume.reset">Reset Volume</button>
     <div class="audio-settings-row" id="audio-settings-row">
       <label class="compact-check audio-settings-mono" id="mono-toggle-label" for="mono-toggle">
         <span class="audio-settings-label-group">
-          <span class="audio-settings-label">Моно</span>
+          <span class="audio-settings-label" data-i18n="popup.mono.label">Mono</span>
          
         </span>
         <input type="checkbox" id="mono-toggle">
-         <span id="mono-global-hint" class="setting-hint control-lock-hint" hidden aria-hidden="true" title="Глобальный монозвук включён в настройках. Измените его там, чтобы обновить эту вкладку.">i</span>
+         <span id="mono-global-hint" class="setting-hint control-lock-hint" hidden aria-hidden="true" title="Global Mono is turned on in Settings. Change it there to update this tab" data-i18n-title="popup.mono.hintTitle">i</span>
       </label>
       <label class="compact-check audio-settings-mute" id="mute-toggle-label" for="mute-toggle">
         <span class="audio-settings-label-group">
-          <span class="audio-settings-label">Без звука</span>
+          <span class="audio-settings-label" data-i18n="popup.mute.label">Mute</span>
         </span>
-        <input type="checkbox" id="mute-toggle" aria-label="Отключить звук текущей вкладки">
+        <input type="checkbox" id="mute-toggle" aria-label="Mute this tab" data-i18n-aria-label="popup.mute.aria">
       </label>
       <div class="balance-control-group">
-        <label for="balance-slider" class="balance-label" id="balance-label">Баланс</label>
+        <label for="balance-slider" class="balance-label" id="balance-label" data-i18n="popup.balance.label">Balance</label>
         <div class="balance-slider-shell">
-          <span class="balance-marker">Л</span>
+          <span class="balance-marker" data-i18n="popup.balance.left">L</span>
           <div class="balance-slider-track">
             <span class="balance-centre-line" aria-hidden="true"></span>
-            <input type="range" class="balance-slider" id="balance-slider" min="-100" max="100" value="0" step="1" aria-label="Баланс">
+            <input type="range" class="balance-slider" id="balance-slider" min="-100" max="100" value="0" step="1" aria-label="Left/right balance" data-i18n-aria-label="popup.balance.aria">
           </div>
-          <span class="balance-marker">П</span>
+          <span class="balance-marker" data-i18n="popup.balance.right">R</span>
         </div>
       </div>
     </div>
     <div id="audio-settings-note" class="audio-settings-note" hidden></div>
-    <div class="audio-controls-separator" aria-hidden="true"></div>
+    <div class="audio-controls-separator" role="presentation">
+      <span class="audio-controls-separator-line" aria-hidden="true"></span>
+      <button type="button" id="compact-toggle" class="compact-toggle" data-global-control="true"
+              aria-expanded="true"
+              data-i18n-title="popup.compact.collapseTitle"
+              data-i18n-aria-label="popup.compact.collapseAria"
+              title="Hide additional features" aria-label="Hide additional features">
+        <svg class="compact-toggle-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+          <path d="M5.5 12.25 10 7.75l4.5 4.5"></path>
+        </svg>
+      </button>
+      <span class="audio-controls-separator-line" aria-hidden="true"></span>
+    </div>
     <!-- End Volume Control Section -->
 
     <!-- Panel Tab Navigation -->
@@ -90,11 +102,11 @@
       <div class="panel-tabs" role="tablist">
         <button class="panel-tab-btn active" id="tab-compressor" data-tab="compressor" role="tab" aria-selected="true" aria-controls="compressor-panel" type="button">
           <span class="panel-tab-icon">🎛️</span>
-          <span class="panel-tab-label">Компрессор</span>
+          <span class="panel-tab-label" data-i18n="popup.panel.compressor">Compressor</span>
         </button>
         <button class="panel-tab-btn" id="tab-other-tabs" data-tab="other-tabs" role="tab" aria-selected="false" aria-controls="other-tabs-panel" type="button">
           <span class="panel-tab-icon">🔊</span>
-          <span class="panel-tab-label">Другие вкладки</span>
+          <span class="panel-tab-label" data-i18n="popup.panel.otherTabs">Other Tabs</span>
           <span class="panel-tab-badge" id="other-tabs-badge"></span>
         </button>
       </div>
@@ -103,33 +115,40 @@
       <div class="panel-content active compression-container" id="compressor-panel" role="tabpanel" aria-labelledby="tab-compressor">
         <div class="compression-header">
           <div class="compression-label-group" id="compression-label-group">
-            <label for="compression-toggle" class="compression-label">Включить компрессор</label>
-            <span id="compression-global-hint" class="setting-hint control-lock-hint" hidden aria-hidden="true" title="Глобальный компрессор включён в настройках. Отключите его там, чтобы менять настройки этой вкладки.">i</span>
+            <label for="compression-toggle" class="compression-label" data-i18n="popup.compressor.enable">Enable Compressor</label>
+            <span id="compression-global-hint" class="setting-hint control-lock-hint" hidden aria-hidden="true" title="Global Compressor is turned on in Settings. Turn it off there to change this tab" data-i18n-title="popup.compressor.hintTitle">i</span>
           </div>
-          <label id="compression-toggle-shell" class="switch" title="Включить или выключить компрессор">
+          <label id="compression-toggle-shell" class="switch" title="Turn the compressor on or off" data-i18n-title="popup.compressor.toggleTitle">
             <input type="checkbox" id="compression-toggle">
             <span class="toggle-slider round"></span>
           </label>
         </div>
         <div class="compression-params hidden" id="compression-params-container">
           <div class="param-control">
-            <label for="compression-threshold" title="Порог: уровень в дБ, с которого начинается сжатие. Более низкие значения сжимают большую часть звука, более высокие — только громкие пики.">Порог: <span id="threshold-value">-24</span> дБ</label>
-            <input type="range" id="compression-threshold" min="-50" max="-10" value="-24" step="1" aria-label="Порог компрессора">
+            <label for="compression-threshold" class="param-label" title="Threshold: the level where compression starts. Lower values affect more of the sound; higher values only reduce the loudest peaks" data-i18n-title="popup.compressor.thresholdTitle">
+              <span class="param-prefix" data-i18n="popup.compressor.thresholdPrefix">Threshold:</span>
+              <span class="param-value" id="threshold-value">-18</span>
+              <span class="param-unit" data-i18n="popup.compressor.thresholdUnit">dB</span>
+            </label>
+            <input type="range" id="compression-threshold" min="-50" max="-10" value="-18" step="1" aria-label="Compressor threshold" data-i18n-aria-label="popup.compressor.thresholdAria">
           </div>
           <div class="param-control">
-            <label for="compression-ratio" title="Степень: насколько сильно снижаются громкие пики после пересечения порога.">Степень: <span id="ratio-value">4</span>:1</label>
-            <input type="range" id="compression-ratio" min="2" max="12" value="4" step="1" aria-label="Степень сжатия компрессора">
+            <label for="compression-ratio" class="param-label" title="Ratio: how strongly loud peaks are reduced after they pass the threshold" data-i18n-title="popup.compressor.ratioTitle">
+              <span class="param-prefix" data-i18n="popup.compressor.ratioPrefix">Ratio:</span>
+              <span class="param-value" id="ratio-value">6</span><span class="param-suffix" data-i18n="popup.compressor.ratioSuffix"> : 1</span>
+            </label>
+            <input type="range" id="compression-ratio" min="2" max="12" value="6" step="1" aria-label="Compressor ratio" data-i18n-aria-label="popup.compressor.ratioAria">
           </div>
         </div>
-        <button id="reset-compressor" class="reset-button panel-reset-btn" type="button">Сбросить компрессор</button>
+        <button id="reset-compressor" class="reset-button panel-reset-btn" type="button" data-i18n="popup.compressor.reset">Reset Compressor</button>
       </div>
 
       <!-- Other Tabs Panel -->
       <div class="panel-content" id="other-tabs-panel" role="tabpanel" aria-labelledby="tab-other-tabs" aria-hidden="true">
         <div class="other-tabs-list" id="other-tabs-list">
           <!-- Tab items will be dynamically inserted here -->
-          <div class="other-tabs-empty" id="other-tabs-empty">
-            Других вкладок со звуком не найдено
+          <div class="other-tabs-empty" id="other-tabs-empty" data-i18n="popup.otherTabs.empty">
+            No other tabs with audio detected
           </div>
         </div>
       </div>
@@ -142,10 +161,10 @@
       <div class="footer-actions">
         <div id="connection-status" class="connection-status" aria-live="polite" aria-atomic="true">
           <span class="status-indicator" aria-hidden="true"></span>
-          <span class="status-text">Проверка...</span>
-          <div class="tooltip" data-tooltip="Нажмите, чтобы переподключиться" role="tooltip"></div>
+          <span class="status-text" data-i18n="popup.status.checking">Checking...</span>
+          <div class="tooltip" data-tooltip="Click to reconnect" data-i18n-tooltip="popup.status.reconnectTooltip" role="tooltip"></div>
         </div>
-        <button id="settings-button" class="icon-button toolbar-icon-button footer-settings-button" data-global-control="true" title="Открыть настройки" aria-label="Открыть настройки" type="button">
+        <button id="settings-button" class="icon-button toolbar-icon-button footer-settings-button" data-global-control="true" title="Open settings" aria-label="Open settings" data-i18n-title="popup.settings.openTitle" data-i18n-aria-label="popup.settings.openAria" type="button">
           <img src="../icons/settings.png" alt="" class="settings-icon" aria-hidden="true">
         </button>
       </div>
@@ -155,22 +174,33 @@
 
   <section id="settings-view" class="popup-view" aria-hidden="true">
     <div class="view-header">
-      <button id="settings-back-button" class="icon-button toolbar-icon-button view-back-button" data-global-control="true" title="Назад к основным элементам управления" aria-label="Назад к основным элементам управления" type="button">
+      <button id="settings-back-button" class="icon-button toolbar-icon-button view-back-button" data-global-control="true" title="Back to main controls" aria-label="Back to main controls" data-i18n-title="popup.settings.backTitle" data-i18n-aria-label="popup.settings.backAria" type="button">
         <svg class="icon-chevron" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
           <path d="M11.75 4.5 6.25 10l5.5 5.5"></path>
         </svg>
       </button>
-      <p class="view-title">Настройки</p>
+      <p class="view-title" data-i18n="popup.settings.title">Settings</p>
       <span class="view-header-spacer" aria-hidden="true"></span>
     </div>
 
     <div class="settings-groups">
       <section class="settings-group">
-        <p class="settings-group-title">Ярлыки</p>
+        <p class="settings-group-title" data-i18n="popup.settings.group.language">Language</p>
+        <div class="settings-row settings-row-with-select">
+          <span class="settings-row-copy">
+            <span class="settings-row-label" data-i18n="popup.settings.language.label">Interface language</span>
+          </span>
+          <select id="settings-language-select" class="settings-select" data-global-control="true" aria-label="Interface language" data-i18n-aria-label="popup.settings.language.aria">
+          </select>
+        </div>
+      </section>
+
+      <section class="settings-group">
+        <p class="settings-group-title" data-i18n="popup.settings.group.shortcuts">Shortcuts</p>
         <button id="open-shortcuts-button" class="settings-link-row" data-global-control="true" type="button">
           <span class="settings-row-copy">
-            <span class="settings-row-label">Горячие клавиши</span>
-            <span class="settings-row-subtitle">(назначения Firefox)</span>
+            <span class="settings-row-label" data-i18n="popup.settings.shortcuts.label">Keyboard shortcuts</span>
+            <span class="settings-row-subtitle" data-i18n="popup.settings.shortcuts.subtitle">(Firefox assignments)</span>
           </span>
           <svg class="settings-link-arrow" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
             <path d="M7 4.5 12.5 10 7 15.5"></path>
@@ -179,14 +209,14 @@
       </section>
 
       <section class="settings-group">
-        <p class="settings-group-title">Глобальные настройки</p>
+        <p class="settings-group-title" data-i18n="popup.settings.group.global">Global Settings</p>
 
         <div class="settings-row settings-row-with-switch">
           <span class="settings-row-copy">
-            <span class="settings-row-label">Включить расширение</span>
-            <span class="settings-row-subtitle">(отключить глобальное управление звуком, не удаляя сохранённые настройки вкладок)</span>
+            <span class="settings-row-label" data-i18n="popup.settings.extensionEnabled.label">Enable Extension</span>
+            <span class="settings-row-subtitle" data-i18n="popup.settings.extensionEnabled.subtitle">(Turn off sound control everywhere without clearing saved tab settings)</span>
           </span>
-          <label class="switch settings-switch" for="settings-extension-enabled-toggle" title="Включить или выключить управление звуком расширением">
+          <label class="switch settings-switch" for="settings-extension-enabled-toggle" title="Turn extension sound control on or off" data-i18n-title="popup.settings.extensionEnabled.title">
             <input type="checkbox" id="settings-extension-enabled-toggle" data-global-control="true">
             <span class="toggle-slider round"></span>
           </label>
@@ -194,16 +224,16 @@
 
         <label class="settings-row">
           <span class="settings-row-copy">
-            <span class="settings-row-label">Глобальный компрессор</span>
-            <span class="settings-row-subtitle">(только новые страницы и после перезагрузки)</span>
+            <span class="settings-row-label" data-i18n="popup.settings.globalCompressor.label">Global Compressor</span>
+            <span class="settings-row-subtitle" data-i18n="popup.settings.globalCompressor.subtitle">(New pages and reloads only)</span>
           </span>
           <input type="checkbox" id="settings-default-compression-toggle" data-global-control="true">
         </label>
 
         <label class="settings-row">
           <span class="settings-row-copy">
-            <span class="settings-row-label">Глобальный монозвук</span>
-            <span class="settings-row-subtitle">(только новые страницы и после перезагрузки)</span>
+            <span class="settings-row-label" data-i18n="popup.settings.globalMono.label">Global Mono Sound</span>
+            <span class="settings-row-subtitle" data-i18n="popup.settings.globalMono.subtitle">(New pages and reloads only)</span>
           </span>
           <input type="checkbox" id="settings-default-mono-toggle" data-global-control="true">
         </label>
@@ -211,23 +241,23 @@
         <div class="settings-slider-row settings-balance-default-row">
           <label class="settings-row settings-inline-toggle">
             <span class="settings-row-copy">
-              <span class="settings-row-label">Глобальный баланс Л/П</span>
-                <span class="settings-row-subtitle">(применяется сразу к открытым вкладкам и новым страницам, пока включено)</span>
+              <span class="settings-row-label" data-i18n="popup.settings.globalBalance.label">Global L/R Balance</span>
+                <span class="settings-row-subtitle" data-i18n="popup.settings.globalBalance.subtitle">(Applies right away to open tabs and new pages while enabled)</span>
             </span>
             <input type="checkbox" id="settings-default-balance-toggle" data-global-control="true">
           </label>
 
           <div class="settings-slider-content" id="settings-default-balance-content">
             <div class="settings-slider-header">
-              <span id="settings-default-balance-value" class="settings-slider-value">Центр</span>
+              <span id="settings-default-balance-value" class="settings-slider-value">Centre</span>
             </div>
             <div class="settings-balance-shell">
-              <span class="balance-marker settings-balance-marker">Л</span>
+              <span class="balance-marker settings-balance-marker" data-i18n="popup.balance.left">L</span>
               <div class="balance-slider-track">
                 <span class="balance-centre-line" aria-hidden="true"></span>
-                <input type="range" class="balance-slider settings-balance-slider" id="settings-default-balance-slider" min="-100" max="100" value="0" step="1" aria-label="Глобальный баланс для открытых и будущих вкладок" data-global-control="true">
+                <input type="range" class="balance-slider settings-balance-slider" id="settings-default-balance-slider" min="-100" max="100" value="0" step="1" aria-label="Global balance for open and future tabs" data-i18n-aria-label="popup.settings.globalBalance.aria" data-global-control="true">
               </div>
-              <span class="balance-marker settings-balance-marker">П</span>
+              <span class="balance-marker settings-balance-marker" data-i18n="popup.balance.right">R</span>
             </div>
           </div>
         </div>
@@ -237,12 +267,12 @@
 
   <section id="shortcuts-view" class="popup-view" aria-hidden="true">
     <div class="view-header">
-      <button id="shortcuts-back-button" class="icon-button toolbar-icon-button view-back-button" data-global-control="true" title="Назад к настройкам" aria-label="Назад к настройкам" type="button">
+      <button id="shortcuts-back-button" class="icon-button toolbar-icon-button view-back-button" data-global-control="true" title="Back to settings" aria-label="Back to settings" data-i18n-title="popup.shortcuts.backTitle" data-i18n-aria-label="popup.shortcuts.backAria" type="button">
         <svg class="icon-chevron" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
           <path d="M11.75 4.5 6.25 10l5.5 5.5"></path>
         </svg>
       </button>
-      <p class="view-title">Горячие клавиши</p>
+      <p class="view-title" data-i18n="popup.shortcuts.title">Keyboard Shortcuts</p>
       <span class="view-header-spacer" aria-hidden="true"></span>
     </div>
 
@@ -250,6 +280,7 @@
   </section>
 
   <script src="../shared/protocol.js"></script>
+  <script src="../shared/i18n.js"></script>
   <script src="modules/constants.js"></script>
   <script src="modules/theme_manager.js"></script>
   <script src="modules/ui_manager.js"></script>

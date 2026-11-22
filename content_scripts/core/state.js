@@ -15,8 +15,6 @@ window.VolumeControl.State = {
     autoplayBypassListenerActive: false,
     visibilityChangeListenerAttached: false,
     
-    // CORS tracking
-    corsAffectedElements: new Set(),
     
     // Current Settings
     currentVolumePercent: DEFAULT_VOLUME_STATE,
@@ -41,6 +39,8 @@ window.VolumeControl.State = {
     
     // Track if volume has been explicitly set
     volumeHasBeenSet: false,
+    volumeOwnership: 'unowned',
+    volumeControl: null,
     muteHasBeenSet: false,
     
     lastReportedStatus: null,

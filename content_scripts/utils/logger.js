@@ -426,7 +426,6 @@ window.VolumeControl.logVolumeEvent = function(eventData) {
         `║   isSliderDrag: ${record.isSliderDrag}`,
         `║   msSinceLastInteraction: ${record.msSinceLastInteraction}ms`,
         `║   msSinceLastMuteToggle: ${record.msSinceLastMuteToggle}ms`,
-        `║   msSinceLastAcceptedMuteInteraction: ${record.msSinceLastAcceptedMuteInteraction}ms`,
         '╠──────────────────────────────────────────────────────────────────────────────',
         '║ CONTEXT:',
         `║   pageHidden: ${record.pageHidden}`,
@@ -507,6 +506,7 @@ function buildGlobalStateSnapshot(State) {
         extensionEnabled: State?.extensionEnabled !== false,
         currentVolumePercent: State?.currentVolumePercent,
         volumeHasBeenSet: Boolean(State?.volumeHasBeenSet),
+        volumeOwnership: State?.volumeOwnership || 'unowned',
         currentMutedState: Boolean(State?.currentMutedState),
         muteHasBeenSet: Boolean(State?.muteHasBeenSet),
         currentMonoEnabled: Boolean(State?.currentMonoEnabled),
@@ -536,7 +536,27 @@ function buildTrackedElementSnapshot(element, stateData, stateManager, syncManag
         lastKnownSrc: stateData?.lastKnownSrc || null,
         passthroughMode: Boolean(stateData?.passthroughMode),
         hasGainNode: Boolean(stateData?.gainNode),
+        // The value last written to the gain node (null when unreadable) and whether a page-write
+        // mask is live: audible level is native volume times gain, so a gain of 0 under a managed
+        // volume above 0 is a silent element that every other number still calls fine.
+        gain: {
+            value: Number.isFinite(Number(stateData?.gainNode?.gain?.value))
+                ? Number(stateData.gainNode.gain.value)
+                : null,
+            maskActive: Boolean(stateData?.gainMask)
+        },
         hasSource: Boolean(stateData?.source),
+        // A non-ACTIVE element that still has nodes but no dedicated handler is the
+        // signature of a capture that stalled after partially building its graph.
+        hasVolumeSyncHandler: Boolean(stateData?.volumeSyncHandler),
+        captureRecovery: {
+            attempts: stateData?.captureRecoveryAttempts ?? 0,
+            pending: Boolean(stateData?.captureRecoveryTimer),
+            lastAttemptAgeMs: ageMs(stateData?.lastCaptureRecoveryAt)
+        },
+        error: stateData?.errorType
+            ? { type: stateData.errorType, message: stateData.errorMessage || null, retryCount: stateData.retryCount ?? 0 }
+            : null,
         playback: {
             connected: Boolean(element?.isConnected),
             paused: Boolean(element?.paused),
@@ -576,12 +596,9 @@ function buildTrackedElementSnapshot(element, stateData, stateManager, syncManag
                 sourceChangeEpoch: syncState.sourceChangeEpoch,
                 rapidChangeCount: syncState.rapidChangeCount ?? 0,
                 lastTrackedPlayerVolume: syncState.lastTrackedPlayerVolume,
-                wasRecentlyHidden: Boolean(syncState.wasRecentlyHidden),
-                lastVisibilityChangeAgeMs: ageMs(syncState.lastVisibilityChangeAt),
                 lastExtensionChangeAgeMs: ageMs(syncState.lastExtensionChangeAt),
                 lastHijackRejectedAgeMs: ageMs(syncState.lastHijackRejectedAt),
                 lastMuteToggleAgeMs: ageMs(syncState.lastMuteToggleAt),
-                lastAcceptedMuteInteractionAgeMs: ageMs(syncState.lastAcceptedMuteInteractionAt),
                 handlerEpoch: syncState.handlerEpoch
             }
             : null
@@ -637,6 +654,7 @@ window.VolumeControl.dumpState = function() {
         `║   extensionEnabled: ${snapshot.state.extensionEnabled}`,
         `║   currentVolumePercent: ${snapshot.state.currentVolumePercent}`,
         `║   volumeHasBeenSet: ${snapshot.state.volumeHasBeenSet}`,
+        `║   volumeOwnership: ${snapshot.state.volumeOwnership}`,
         `║   currentMutedState: ${snapshot.state.currentMutedState}`,
         `║   muteHasBeenSet: ${snapshot.state.muteHasBeenSet}`,
         `║   currentMonoEnabled: ${snapshot.state.currentMonoEnabled}`,
@@ -649,7 +667,10 @@ window.VolumeControl.dumpState = function() {
     snapshot.trackedElements.forEach((entry) => {
         lines.push(`║   ${entry.elementInfo}:`);
         lines.push(`║     state=${entry.state}, active=${entry.active}, corsBlocked=${entry.corsBlocked}, passthrough=${entry.passthroughMode}, sourceType=${entry.sourceType || 'none'}`);
+        lines.push(`║     graph gain=${entry.hasGainNode}, source=${entry.hasSource}, volumeHandler=${entry.hasVolumeSyncHandler}, recoveryAttempts=${entry.captureRecovery.attempts}, recoveryPending=${entry.captureRecovery.pending}`);
+        lines.push(`║     error=${entry.error ? `${entry.error.type}: ${(entry.error.message || '').toString().substring(0, 60)} (retries=${entry.error.retryCount})` : 'none'}`);
         lines.push(`║     native volume=${entry.nativeState.elementVolume}%, muted=${entry.nativeState.elementMuted}, observed=${entry.nativeState.observedNativeVolume}%/${entry.nativeState.observedNativeMutedState}, managedMute=${entry.nativeState.managedMutedState}, snapshot=${entry.nativeState.nativeVolumeSnapshot}%/${entry.nativeState.nativeMutedSnapshot}`);
+        lines.push(`║     level gain.value=${entry.gain.value}, gainMask=${entry.gain.maskActive}, lastApplied=${entry.nativeState.lastAppliedVolume}%, native=${entry.nativeState.elementVolume}%`);
         lines.push(`║     playback paused=${entry.playback.paused}, readyState=${entry.playback.readyState}, currentTime=${entry.playback.currentTime}, visible=${entry.playback.isIntersecting}`);
         lines.push(`║     verification needsRepair=${entry.verification.needsConnectionVerification}, failures=${entry.verification.consecutiveVerificationFailures}, lastVerifiedAudioAgeMs=${entry.verification.lastVerifiedAudioAgeMs}`);
         lines.push(`║     sync applying=${entry.sync?.isApplyingVolume}, targetVolume=${entry.sync?.targetVolume}, sourceChanging=${entry.sync?.isSourceChanging}, rapidChangeCount=${entry.sync?.rapidChangeCount}, lastRejectAgeMs=${entry.sync?.lastHijackRejectedAgeMs}`);

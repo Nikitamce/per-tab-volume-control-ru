@@ -22,6 +22,8 @@ window.Popup.OtherTabsManager = {
     audioTabs: [],
     volumeDebounceTimers: new Map(),
     compressionDebounceTimers: new Map(),
+    pendingRemoteVolumes: new Map(),
+    pendingRemoteCompression: new Map(),
     refreshTimer: null,
     refreshSettleTimer: null,
     refreshSettleUntil: 0,
@@ -41,10 +43,11 @@ window.Popup.OtherTabsManager = {
     // When user is holding buttons or editing volume, defer full refresh/rerender
     pendingRefresh: false,
     pendingRefreshOptions: null,
+    // Options of the request currently awaiting a response (null when none), so an
+    // interaction that supersedes it can re-queue the same request afterwards.
+    inFlightRefreshOptions: null,
+    // Set only once a forceHydrate request has been answered and applied.
     didInitialHydrate: false,
-
-    // Favicon cache for efficient image handling
-    faviconCache: new Map(), // url -> objectUrl
 
     // Active button hold state - centralized to prevent orphaned timers
     activeHold: {
@@ -67,7 +70,6 @@ window.Popup.OtherTabsManager = {
     // These are getters that read from the shared constants object
     get VOLUME_DEBOUNCE_MS() { return window.Popup?.Constants?.VOLUME_DEBOUNCE_MS ?? 150; },
     get COMPRESSION_DEBOUNCE_MS() { return window.Popup?.Constants?.COMPRESSION_DEBOUNCE_MS ?? 200; },
-    get VOLUME_STEP_INITIAL() { return window.Popup?.Constants?.VOLUME_ADJUST_STEP ?? 5; },
     get VOLUME_STEP_REPEAT() { return window.Popup?.Constants?.VOLUME_ADJUST_STEP ?? 5; },
     get INITIAL_HOLD_DELAY_MS() { return window.Popup?.Constants?.INITIAL_VOLUME_ADJUST_DELAY_MS ?? 400; },
     get INITIAL_INTERVAL_MS() { return window.Popup?.Constants?.INITIAL_VOLUME_ADJUST_INTERVAL_MS ?? 80; },
@@ -85,6 +87,13 @@ window.Popup.OtherTabsManager = {
     REFRESH_SETTLE_DELAY_MS: 450,
 
     /**
+     * Translate helper with English fallback when i18n is unavailable.
+     */
+    t: function(key, subs) {
+        return globalThis.VCI18n?.t?.(key, subs) ?? key;
+    },
+
+    /**
      * Initialize the Other Tabs Manager
      * @param {number} currentTabId - The current active tab ID
      */
@@ -95,7 +104,6 @@ window.Popup.OtherTabsManager = {
         this.initializeElements();
         this.setupGlobalEventListeners();
         this.refreshTabs({ forceHydrate: true });
-        this.didInitialHydrate = true;
         this.syncRefreshLoop();
     },
 
@@ -158,8 +166,26 @@ window.Popup.OtherTabsManager = {
         return window.Popup?.PanelTabManager?.getActiveTab?.() === 'other-tabs';
     },
 
+    isCompactMode: function() {
+        return Boolean(window.Popup?.UIManager?.isCompactMode?.());
+    },
+
     shouldRunWatchdogRefresh: function() {
-        return this.isOtherTabsPanelActive() && document.visibilityState === 'visible';
+        return this.isOtherTabsPanelActive()
+            && document.visibilityState === 'visible'
+            && !this.isCompactMode();
+    },
+
+    /**
+     * Compact mode hides the panel, so the poll pauses while collapsed and
+     * the list refreshes straight away on expand.
+     * @param {boolean} isCompact
+     */
+    handleCompactModeChanged: function(isCompact) {
+        this.syncRefreshLoop();
+        if (!isCompact && this.shouldRunWatchdogRefresh()) {
+            this.requestRefresh({ forceHydrate: !this.didInitialHydrate });
+        }
     },
 
     isRefreshSettling: function() {
@@ -206,6 +232,10 @@ window.Popup.OtherTabsManager = {
 
     handleVisibilityChange: function() {
         this.syncRefreshLoop();
+        if (document.hidden || document.visibilityState === 'hidden') {
+            this.flushPendingSends();
+            return;
+        }
         if (document.visibilityState === 'visible' && this.isOtherTabsPanelActive()) {
             this.requestRefresh();
         }
@@ -228,32 +258,6 @@ window.Popup.OtherTabsManager = {
             return;
         }
 
-        if (message.type === OtherTabsMessages.VOLUME_UPDATE) {
-            const tabId = message.payload?.tabId;
-            const volume = message.payload?.volume;
-            if (!tabId || tabId === this.currentTabId || typeof volume !== 'number') {
-                return;
-            }
-
-            const existing = this.audioTabs.find(t => t.tabId === tabId);
-            if (!existing) {
-                this.requestRefresh();
-                return;
-            }
-
-            const isHeldTab = this.activeHold.tabId === tabId;
-            const normalizedVolume = OtherTabsProtocol.normalizeVolume(volume, existing.volume);
-            if (!isHeldTab) {
-                if (existing.muted) {
-                    existing.volumeBeforeMute = normalizedVolume;
-                } else {
-                    existing.volume = normalizedVolume;
-                }
-            }
-            this.updateRowUI(tabId);
-            return;
-        }
-
         if (message.type === OtherTabsMessages.TAB_AUDIO_STATE_CHANGED) {
             this.requestRefresh();
         }
@@ -271,14 +275,35 @@ window.Popup.OtherTabsManager = {
      */
     requestRefresh: function(options = {}) {
         if (this.isUserInteracting() || this.isRefreshSettling()) {
-            this.pendingRefresh = true;
-            this.pendingRefreshOptions = {
-                ...(this.pendingRefreshOptions || {}),
-                ...(options || {})
-            };
+            this.deferRefresh(options);
             return;
         }
         this.refreshTabs(options);
+    },
+
+    /**
+     * Queue a refresh for the settle/flush machinery to drain once the
+     * interaction ends. Options from several deferrals are merged.
+     */
+    deferRefresh: function(options = {}) {
+        this.pendingRefresh = true;
+        this.pendingRefreshOptions = {
+            ...(this.pendingRefreshOptions || {}),
+            ...(options || {})
+        };
+    },
+
+    /**
+     * An interaction (hold or inline edit) is starting: any response still in
+     * flight was requested before it and must not repaint over it. Advance the
+     * epoch and re-queue that request so the list refreshes afterwards.
+     */
+    invalidateRefreshInFlight: function() {
+        this.refreshRequestId += 1;
+        if (this.inFlightRefreshOptions) {
+            this.deferRefresh(this.inFlightRefreshOptions);
+            this.inFlightRefreshOptions = null;
+        }
     },
 
     /**
@@ -316,27 +341,34 @@ window.Popup.OtherTabsManager = {
      * Refresh the list of tabs with audio
      */
     refreshTabs: async function(options = {}) {
+        let requestId = null;
         try {
             if (this.isUserInteracting() || this.isRefreshSettling()) {
-                this.pendingRefresh = true;
-                this.pendingRefreshOptions = {
-                    ...(this.pendingRefreshOptions || {}),
-                    ...(options || {})
-                };
+                this.deferRefresh(options);
                 return;
             }
 
-            const requestId = ++this.refreshRequestId;
+            // A superseded hydrate request hands its hydrate duty to its successor.
+            const forceHydrate = Boolean(options.forceHydrate)
+                || Boolean(this.inFlightRefreshOptions?.forceHydrate);
+            requestId = ++this.refreshRequestId;
+            this.inFlightRefreshOptions = { forceHydrate };
 
             const response = await browser.runtime.sendMessage({
                 type: OtherTabsMessages.GET_AUDIO_TABS,
                 payload: {
                     excludeTabId: this.currentTabId,
-                    forceHydrate: Boolean(options.forceHydrate)
+                    forceHydrate
                 }
             });
 
             if (requestId !== this.refreshRequestId) {
+                return;
+            }
+            this.inFlightRefreshOptions = null;
+
+            if (this.isUserInteracting() || this.isRefreshSettling()) {
+                this.deferRefresh({ forceHydrate });
                 return;
             }
 
@@ -363,8 +395,14 @@ window.Popup.OtherTabsManager = {
                 }
 
                 this.updateBadge();
+                if (forceHydrate) {
+                    this.didInitialHydrate = true;
+                }
             }
         } catch (error) {
+            if (requestId !== null && requestId === this.refreshRequestId) {
+                this.inFlightRefreshOptions = null;
+            }
             console.error("Failed to get audio tabs:", error);
         }
     },
@@ -405,9 +443,6 @@ window.Popup.OtherTabsManager = {
 
         const count = this.audioTabs.length;
 
-        // Track which favicons are still in use
-        const currentFavicons = new Set();
-
         // Clear existing tab items (except empty message)
         const existingItems = this.elements.list.querySelectorAll('.other-tab-item');
         existingItems.forEach(item => item.remove());
@@ -415,8 +450,6 @@ window.Popup.OtherTabsManager = {
         // Show/hide empty message
         if (count === 0) {
             this.elements.empty.classList.add('visible');
-            // Clean up all cached favicons since no tabs
-            this.cleanupFaviconCache(currentFavicons);
             return;
         }
 
@@ -424,15 +457,9 @@ window.Popup.OtherTabsManager = {
 
         // Render each tab
         this.audioTabs.forEach(tab => {
-            if (tab.favIconUrl) {
-                currentFavicons.add(tab.favIconUrl);
-            }
             const tabElement = this.createTabElement(tab);
             this.elements.list.appendChild(tabElement);
         });
-
-        // Clean up unused favicon cache entries
-        this.cleanupFaviconCache(currentFavicons);
     },
 
     /**
@@ -452,7 +479,9 @@ window.Popup.OtherTabsManager = {
         favicon.alt = '';
         favicon.draggable = false;
         favicon.onerror = () => {
-            favicon.src = 'icons/default-favicon.svg';
+            // Clear first so a missing fallback cannot re-trigger this handler.
+            favicon.onerror = null;
+            favicon.src = this.getCachedFavicon(null);
         };
 
         // Tab info container - now clickable entire row
@@ -463,7 +492,6 @@ window.Popup.OtherTabsManager = {
         const title = document.createElement('span');
         title.className = 'other-tab-title';
         title.textContent = this.truncateTitle(tab.title, 18);
-        title.title = tab.title; // Full title on hover
 
         // Double-click title to reset volume to 100%
         title.addEventListener('dblclick', (e) => {
@@ -482,8 +510,6 @@ window.Popup.OtherTabsManager = {
         const muteBtn = document.createElement('button');
         muteBtn.className = 'other-tab-icon-btn mute-btn' + (tab.muted ? ' muted' : '');
         muteBtn.textContent = tab.muted ? '🔇' : '🔊';
-        muteBtn.title = tab.muted ? 'Включить звук' : 'Без звука';
-        muteBtn.setAttribute('aria-label', tab.muted ? 'Включить звук' : 'Без звука');
         muteBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             this.toggleMute(tab.tabId);
@@ -494,8 +520,6 @@ window.Popup.OtherTabsManager = {
         compressorBtn.className = 'other-tab-icon-btn compressor-btn' + (tab.compressionEnabled ? ' active' : '');
         compressorBtn.textContent = '🎛️';
         compressorBtn.disabled = false;
-        compressorBtn.title = tab.compressionEnabled ? 'Выключить компрессор' : 'Включить компрессор';
-        compressorBtn.setAttribute('aria-label', tab.compressionEnabled ? 'Выключить компрессор' : 'Включить компрессор');
         compressorBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             this.toggleCompressor(tab.tabId);
@@ -505,8 +529,6 @@ window.Popup.OtherTabsManager = {
         const decrementBtn = document.createElement('button');
         decrementBtn.className = 'other-tab-volume-btn decrement';
         decrementBtn.textContent = '−';
-        decrementBtn.title = 'Уменьшить громкость (удерживайте для повтора)';
-        decrementBtn.setAttribute('aria-label', 'Уменьшить громкость');
         this.setupVolumeButton(decrementBtn, tab.tabId, -1);
 
         // Volume value (clickable for direct input)
@@ -514,7 +536,6 @@ window.Popup.OtherTabsManager = {
         volumeValue.className = 'other-tab-volume-value' + (tab.muted ? ' muted' : '');
         volumeValue.textContent = `${Math.round(tab.muted ? tab.volumeBeforeMute || tab.volume : tab.volume)}%`;
         volumeValue.setAttribute('data-tab-id', tab.tabId);
-        volumeValue.title = 'Нажмите, чтобы изменить громкость';
         volumeValue.addEventListener('click', (e) => {
             e.stopPropagation();
             this.startVolumeInput(tab.tabId, volumeValue);
@@ -524,16 +545,12 @@ window.Popup.OtherTabsManager = {
         const incrementBtn = document.createElement('button');
         incrementBtn.className = 'other-tab-volume-btn increment';
         incrementBtn.textContent = '+';
-        incrementBtn.title = 'Увеличить громкость (удерживайте для повтора)';
-        incrementBtn.setAttribute('aria-label', 'Увеличить громкость');
         this.setupVolumeButton(incrementBtn, tab.tabId, 1);
 
         // Focus tab button (clickable row indicator)
         const focusBtn = document.createElement('button');
         focusBtn.className = 'other-tab-focus-btn';
         focusBtn.textContent = '↗';
-        focusBtn.title = 'Перейти на эту вкладку';
-        focusBtn.setAttribute('aria-label', 'Перейти на эту вкладку';
         focusBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             this.focusTab(tab.tabId, tab.windowId);
@@ -550,41 +567,77 @@ window.Popup.OtherTabsManager = {
         item.appendChild(infoContainer);
         item.appendChild(controlsContainer);
 
+        // Single source of truth for all hover/aria copy on this row.
+        this.applyLocalizedRowCopy(item, tab);
+
         return item;
     },
 
     /**
-     * Get cached favicon URL or cache it
+     * Apply every localized title/aria-label on an Other Tabs row.
+     * Used on create and on language change so no control keeps stale copy.
+     * @param {HTMLElement} row
+     * @param {Object} tab
+     */
+    applyLocalizedRowCopy: function(row, tab) {
+        if (!row || !tab) {
+            return;
+        }
+
+        const titleEl = row.querySelector('.other-tab-title');
+        if (titleEl) {
+            titleEl.title = tab.title || this.t('otherTabs.unknownTab');
+        }
+
+        const muteBtn = row.querySelector('.other-tab-icon-btn.mute-btn');
+        if (muteBtn) {
+            const muteLabel = tab.muted ? this.t('otherTabs.unmute') : this.t('otherTabs.mute');
+            muteBtn.title = muteLabel;
+            muteBtn.setAttribute('aria-label', muteLabel);
+        }
+
+        const compressorBtn = row.querySelector('.other-tab-icon-btn.compressor-btn');
+        if (compressorBtn) {
+            const compressorLabel = tab.compressionEnabled
+                ? this.t('otherTabs.disableCompressor')
+                : this.t('otherTabs.enableCompressor');
+            compressorBtn.title = compressorLabel;
+            compressorBtn.setAttribute('aria-label', compressorLabel);
+        }
+
+        const decrementBtn = row.querySelector('.other-tab-volume-btn.decrement');
+        if (decrementBtn) {
+            decrementBtn.title = this.t('otherTabs.decreaseTitle');
+            decrementBtn.setAttribute('aria-label', this.t('otherTabs.decreaseAria'));
+        }
+
+        const incrementBtn = row.querySelector('.other-tab-volume-btn.increment');
+        if (incrementBtn) {
+            incrementBtn.title = this.t('otherTabs.increaseTitle');
+            incrementBtn.setAttribute('aria-label', this.t('otherTabs.increaseAria'));
+        }
+
+        const volumeValue = row.querySelector('.other-tab-volume-value');
+        if (volumeValue) {
+            volumeValue.title = this.t('otherTabs.editVolume');
+        }
+
+        const focusBtn = row.querySelector('.other-tab-focus-btn');
+        if (focusBtn) {
+            const focusLabel = this.t('otherTabs.focusTitle');
+            focusBtn.title = focusLabel;
+            focusBtn.setAttribute('aria-label', this.t('otherTabs.focusAria'));
+        }
+    },
+
+    /**
+     * Resolve a favicon URL, falling back to the bundled placeholder.
      * @param {string} url - Original favicon URL
      * @returns {string} - URL to use for favicon
      */
     getCachedFavicon: function(url) {
-        if (!url) return 'icons/default-favicon.svg';
-        
-        // If already cached, return it
-        if (this.faviconCache.has(url)) {
-            return this.faviconCache.get(url) || url;
-        }
-        
-        // Cache the URL (we don't create blob URLs for external URLs)
-        this.faviconCache.set(url, url);
-        return url;
-    },
-
-    /**
-     * Clean up favicon cache entries no longer in use
-     * @param {Set} currentUrls - Set of URLs currently being used
-     */
-    cleanupFaviconCache: function(currentUrls) {
-        const toDelete = [];
-        this.faviconCache.forEach((cached, url) => {
-            if (!currentUrls.has(url)) {
-                toDelete.push(url);
-            }
-        });
-        toDelete.forEach(url => {
-            this.faviconCache.delete(url);
-        });
+        // Relative to popup/popup.html: the placeholder lives in the extension-root icons/ folder.
+        return url || '../icons/default-favicon.svg';
     },
 
     /**
@@ -601,7 +654,12 @@ window.Popup.OtherTabsManager = {
         const startHold = (e) => {
             e.preventDefault();
             e.stopPropagation();
+
+            // preventDefault above skips the input blur, so commit an open editor here
+            // rather than letting its stale text land over the held volume on release.
+            self.commitVolumeInput();
             self.cancelRefreshSettleWindow();
+            self.invalidateRefreshInFlight();
             
             // Stop any existing hold first
             self.stopHold();
@@ -747,7 +805,7 @@ window.Popup.OtherTabsManager = {
 
         const volumeEl = row.querySelector(`.other-tab-volume-value[data-tab-id="${tabId}"]`);
         if (volumeEl) {
-            const displayVolume = tab.muted ? (tab.volumeBeforeMute || tab.volume) : tab.volume;
+            const displayVolume = tab.muted ? (tab.volumeBeforeMute ?? tab.volume) : tab.volume;
             volumeEl.textContent = `${Math.round(displayVolume)}%`;
             volumeEl.classList.toggle('muted', tab.muted);
         }
@@ -756,8 +814,6 @@ window.Popup.OtherTabsManager = {
         if (muteBtn) {
             muteBtn.classList.toggle('muted', tab.muted);
             muteBtn.textContent = tab.muted ? '🔇' : '🔊';
-            muteBtn.title = tab.muted ? 'Включить звук' : 'Без звука';
-            muteBtn.setAttribute('aria-label', tab.muted ? 'Включить звук' : 'Без звука');
         }
 
         const compressorBtn = row.querySelector('.other-tab-icon-btn.compressor-btn');
@@ -765,9 +821,23 @@ window.Popup.OtherTabsManager = {
             compressorBtn.classList.toggle('active', Boolean(tab.compressionEnabled));
             compressorBtn.classList.remove('disabled');
             compressorBtn.disabled = false;
-            compressorBtn.title = tab.compressionEnabled ? 'Выключить компрессор' : 'Включить компрессор';
-            compressorBtn.setAttribute('aria-label', tab.compressionEnabled ? 'Выключить компрессор' : 'Включить компрессор');
         }
+
+        this.applyLocalizedRowCopy(row, tab);
+    },
+
+    /**
+     * Re-apply localized titles/aria-labels after a language change.
+     * Covers mute, compressor, +/- hold buttons, volume edit, and focus.
+     */
+    refreshLocalizedCopy: function() {
+        if (!this.elements.list) {
+            return;
+        }
+        if (!Array.isArray(this.audioTabs) || this.audioTabs.length === 0) {
+            return;
+        }
+        this.audioTabs.forEach((tab) => this.updateRowUI(tab.tabId));
     },
 
     /**
@@ -806,6 +876,15 @@ window.Popup.OtherTabsManager = {
     },
 
     /**
+     * Step the inline volume editor by 1% via the shared popup helper.
+     * @param {HTMLInputElement} input
+     * @param {number} direction - positive increases, negative decreases
+     */
+    nudgeInlineVolumeInput: function(input, direction) {
+        window.Popup.Utils.nudgeVolumeInput(input, direction);
+    },
+
+    /**
      * Start inline volume input editing
      * @param {number} tabId - Tab ID
      * @param {HTMLElement} valueElement - The volume value span element
@@ -818,7 +897,9 @@ window.Popup.OtherTabsManager = {
         const tab = this.audioTabs.find(t => t.tabId === tabId);
         if (!tab) return;
 
-        const currentVolume = tab.muted ? (tab.volumeBeforeMute || tab.volume) : tab.volume;
+        this.invalidateRefreshInFlight();
+
+        const currentVolume = tab.muted ? (tab.volumeBeforeMute ?? tab.volume) : tab.volume;
         const Utils = window.Popup?.Utils;
         
         // Store state
@@ -848,6 +929,8 @@ window.Popup.OtherTabsManager = {
         
         const self = this;
         
+        window.Popup.Utils.bindVolumeInputWheel(input);
+
         // Prevent invalid characters from being typed
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
@@ -864,15 +947,9 @@ window.Popup.OtherTabsManager = {
             // Allow: backspace, delete, tab, arrows, home, end
             const allowedKeys = ['Backspace', 'Delete', 'Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'];
             if (allowedKeys.includes(e.key)) {
-                // Handle arrow up/down for increment/decrement
                 if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
                     e.preventDefault();
-                    const currentVal = parseInt(input.value, 10) || 0;
-                    const direction = e.key === 'ArrowUp' ? 1 : -1;
-                    const newVal = Math.max(self.MIN_VOLUME, Math.min(self.MAX_VOLUME, currentVal + direction));
-                    input.value = String(newVal);
-                    // Trigger input event to apply volume
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    self.nudgeInlineVolumeInput(input, e.key === 'ArrowUp' ? 1 : -1);
                 }
                 return;
             }
@@ -1019,6 +1096,7 @@ window.Popup.OtherTabsManager = {
         
         const input = this.activeVolumeInput.element;
         const tabId = this.activeVolumeInput.tabId;
+        const originalValue = this.activeVolumeInput.originalValue;
         const tab = this.audioTabs.find(t => t.tabId === tabId);
         
         // Clean up input
@@ -1028,9 +1106,23 @@ window.Popup.OtherTabsManager = {
             valueSpan.style.display = '';
         }
         
-        // Restore display
+        // Live input already mutated the tab and queued or sent remote volumes, so revert
+        // to the value captured when the editor opened rather than the live one.
+        if (tab && typeof originalValue === 'number') {
+            const liveVolume = tab.muted ? (tab.volumeBeforeMute ?? tab.volume) : tab.volume;
+            if (liveVolume !== originalValue) {
+                if (tab.muted) {
+                    tab.volumeBeforeMute = originalValue;
+                } else {
+                    tab.volume = originalValue;
+                }
+                this.sendVolumeToTab(tabId, originalValue, { immediate: true });
+            }
+        }
+
+        // Restore display (muted rows show the pre-mute target, not the silenced 0)
         if (tab) {
-            this.updateVolumeDisplay(tabId, tab.volume, tab.muted);
+            this.updateVolumeDisplay(tabId, tab.muted ? (tab.volumeBeforeMute ?? tab.volume) : tab.volume, tab.muted);
         }
         
         // Clear state
@@ -1052,8 +1144,9 @@ window.Popup.OtherTabsManager = {
         if (tab.muted) {
             // Unmute - restore the latest remembered target volume.
             tab.muted = false;
-            const restoreVolume = (tab.volumeBeforeMute && tab.volumeBeforeMute > 0) 
-                                  ? tab.volumeBeforeMute 
+            // Mute-at-0 has no audible restore target; unmute to 100 so the tab is not stuck silent.
+            const restoreVolume = (tab.volumeBeforeMute && tab.volumeBeforeMute > 0)
+                                  ? tab.volumeBeforeMute
                                   : this.DEFAULT_VOLUME;
             tab.volume = restoreVolume;
             delete tab.volumeBeforeMute;
@@ -1112,42 +1205,37 @@ window.Popup.OtherTabsManager = {
      */
     sendVolumeToTab: function(tabId, volume, options = {}) {
         const immediate = Boolean(options.immediate);
+        const normalized = OtherTabsProtocol.normalizeVolume(volume, this.DEFAULT_VOLUME);
+        this.pendingRemoteVolumes.set(tabId, normalized);
 
-        // Clear existing timer for this tab
         if (this.volumeDebounceTimers.has(tabId)) {
             clearTimeout(this.volumeDebounceTimers.get(tabId));
         }
 
-        if (immediate) {
+        const send = () => {
+            const pending = this.pendingRemoteVolumes.get(tabId);
+            this.pendingRemoteVolumes.delete(tabId);
             this.volumeDebounceTimers.delete(tabId);
+            if (pending == null) {
+                return;
+            }
             browser.runtime.sendMessage({
                 type: OtherTabsMessages.SET_REMOTE_TAB_VOLUME,
                 payload: {
                     tabId: tabId,
-                    volume: OtherTabsProtocol.normalizeVolume(volume, this.DEFAULT_VOLUME)
+                    volume: pending
                 }
             }).catch((error) => {
                 console.error(`Failed to set volume for tab ${tabId}:`, error);
             });
+        };
+
+        if (immediate) {
+            send();
             return;
         }
 
-        // Set debounced send
-        const timer = setTimeout(async () => {
-            this.volumeDebounceTimers.delete(tabId);
-            try {
-                await browser.runtime.sendMessage({
-                    type: OtherTabsMessages.SET_REMOTE_TAB_VOLUME,
-                    payload: {
-                        tabId: tabId,
-                        volume: OtherTabsProtocol.normalizeVolume(volume, this.DEFAULT_VOLUME)
-                    }
-                });
-            } catch (error) {
-                console.error(`Failed to set volume for tab ${tabId}:`, error);
-            }
-        }, this.VOLUME_DEBOUNCE_MS);
-
+        const timer = setTimeout(send, this.VOLUME_DEBOUNCE_MS);
         this.volumeDebounceTimers.set(tabId, timer);
     },
 
@@ -1158,42 +1246,37 @@ window.Popup.OtherTabsManager = {
      */
     sendCompressionToTab: function(tabId, settings, options = {}) {
         const immediate = Boolean(options.immediate);
-        
-        // Clear existing timer for this tab
+        const normalized = OtherTabsProtocol.normalizeCompressionSettings(settings);
+        this.pendingRemoteCompression.set(tabId, normalized);
+
         if (this.compressionDebounceTimers.has(tabId)) {
             clearTimeout(this.compressionDebounceTimers.get(tabId));
         }
 
-        if (immediate) {
+        const send = () => {
+            const pending = this.pendingRemoteCompression.get(tabId);
+            this.pendingRemoteCompression.delete(tabId);
             this.compressionDebounceTimers.delete(tabId);
+            if (!pending) {
+                return;
+            }
             browser.runtime.sendMessage({
                 type: OtherTabsMessages.SET_REMOTE_TAB_COMPRESSION,
                 payload: {
                     tabId: tabId,
-                    settings: OtherTabsProtocol.normalizeCompressionSettings(settings)
+                    settings: pending
                 }
             }).catch((error) => {
                 console.error(`Failed to set compression for tab ${tabId}:`, error);
             });
+        };
+
+        if (immediate) {
+            send();
             return;
         }
 
-        // Set debounced send
-        const timer = setTimeout(async () => {
-            this.compressionDebounceTimers.delete(tabId);
-            try {
-                await browser.runtime.sendMessage({
-                    type: OtherTabsMessages.SET_REMOTE_TAB_COMPRESSION,
-                    payload: {
-                        tabId: tabId,
-                        settings: OtherTabsProtocol.normalizeCompressionSettings(settings)
-                    }
-                });
-            } catch (error) {
-                console.error(`Failed to set compression for tab ${tabId}:`, error);
-            }
-        }, this.COMPRESSION_DEBOUNCE_MS);
-
+        const timer = setTimeout(send, this.COMPRESSION_DEBOUNCE_MS);
         this.compressionDebounceTimers.set(tabId, timer);
     },
 
@@ -1225,20 +1308,48 @@ window.Popup.OtherTabsManager = {
      * @returns {string}
      */
     truncateTitle: function(title, maxLength) {
-        if (!title) return 'Без названия';
+        if (!title) return this.t('otherTabs.unknownTab');
         if (title.length <= maxLength) return title;
-        return title.substring(0, maxLength - 1) + '…';
+        return title.substring(0, maxLength - 1) + '...';
+    },
+
+    flushPendingSends: function() {
+        // Settle the held volume and any open editor first so their sends are not lost.
+        this.stopHold();
+        this.commitVolumeInput();
+
+        this.volumeDebounceTimers.forEach((timer) => clearTimeout(timer));
+        this.volumeDebounceTimers.clear();
+        this.pendingRemoteVolumes.forEach((volume, tabId) => {
+            browser.runtime.sendMessage({
+                type: OtherTabsMessages.SET_REMOTE_TAB_VOLUME,
+                payload: { tabId, volume }
+            }).catch(() => {});
+        });
+        this.pendingRemoteVolumes.clear();
+
+        this.compressionDebounceTimers.forEach((timer) => clearTimeout(timer));
+        this.compressionDebounceTimers.clear();
+        this.pendingRemoteCompression.forEach((settings, tabId) => {
+            browser.runtime.sendMessage({
+                type: OtherTabsMessages.SET_REMOTE_TAB_COMPRESSION,
+                payload: { tabId, settings }
+            }).catch(() => {});
+        });
+        this.pendingRemoteCompression.clear();
     },
 
     /**
      * Clean up resources
      */
     cleanup: function() {
+        this.flushPendingSends();
         this.stopHold();
         this.commitVolumeInput();
         this.stopAutoRefresh();
         this.cancelRefreshSettleWindow();
         this.refreshRequestId += 1;
+        this.inFlightRefreshOptions = null;
 
         if (this.listenersBound) {
             document.removeEventListener('mouseup', this.handlers.mouseup);
@@ -1257,8 +1368,5 @@ window.Popup.OtherTabsManager = {
         this.volumeDebounceTimers.clear();
         this.compressionDebounceTimers.forEach(timer => clearTimeout(timer));
         this.compressionDebounceTimers.clear();
-        
-        // Clear favicon cache
-        this.faviconCache.clear();
     }
 };

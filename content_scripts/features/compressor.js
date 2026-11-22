@@ -15,7 +15,6 @@ window.VolumeControl.Compressor = {};
         DEFAULT_COMPRESSOR_RELEASE,
         MAKEUP_GAIN_ENABLED,
         MAKEUP_GAIN_FACTOR,
-        PRE_COMPRESSOR_GAIN_DB,
         COMPRESSOR_MONITOR_INTERVAL_MS,
         COMPRESSOR_THRESHOLD_MIN,
         COMPRESSOR_THRESHOLD_MAX,
@@ -96,15 +95,6 @@ window.VolumeControl.Compressor = {};
         const makeupGainLinear = Math.pow(10, makeupGainDb / 20);
         
         return makeupGainLinear;
-    }
-
-    /**
-     * Calculate pre-compressor gain (boost before compression)
-     * @returns {number} - Linear gain multiplier
-     */
-    function calculatePreGain() {
-        const preGainDb = PRE_COMPRESSOR_GAIN_DB || 6;
-        return Math.pow(10, preGainDb / 20);
     }
 
     /**
@@ -253,7 +243,6 @@ window.VolumeControl.Compressor = {};
         // Functions
         validateSettings,
         calculateMakeupGain,
-        calculatePreGain,
         applySettings,
         getReduction,
         isCompressing,

@@ -9,6 +9,12 @@ window.VolumeControl.VolumeController = {};
 (function() {
     const { log, verbose, warn, logVolumeApply } = window.VolumeControl;
     const { NATIVE_VOLUME_EPSILON } = window.VolumeControl;
+    const Protocol = globalThis.VCProtocol;
+    const MASK_MIN_NATIVE_VOLUME = 0.001; // Below this a page write is silent and gain cannot hold it
+    const MASK_MAX_SCALE = 100; // Upper bound for the compensating step on a very quiet page write
+    const MASK_FAILSAFE_MS = 500; // A mask never outlives this, even if no decision ever releases it
+    // Last gain written to a node outside any mask, kept per node so a rebuilt graph starts fresh.
+    const restingGain = new WeakMap();
 
     /**
      * Calculate native volume and gain multiplier from desired percentage
@@ -86,16 +92,21 @@ window.VolumeControl.VolumeController = {};
         // Apply volume: use native volume up to 100%, then keep native at 100% and use gain for amplification above 100%
         setNativeVolume(element, nativeVolume);
         
-        // Gain compensates if native can't reach target
+        // Gain compensates if native can't reach target. Native at 0 has nothing to compensate:
+        // the gain stays at its multiplier (1 up to 100%), because a gain of 0 would be a second,
+        // hidden mute that no later non-zero native volume undoes.
         const appliedNative = element.volume;
-        const effectiveGain = appliedNative === 0 ? 0 : gainMultiplier / appliedNative * nativeVolume;
+        const effectiveGain = appliedNative > 0 ? gainMultiplier / appliedNative * nativeVolume : gainMultiplier;
         
         setGainNode(stateData, effectiveGain);
+
+        // Native is back at the managed value, so the page-write mask has done its job.
+        releasePageVolumeMask(stateData);
         
         stateData.lastAppliedVolume = volumePercent;
         
         verbose(`[VolumeController] Applied ${volumePercent}% to ${elementInfo}: ` +
-                `native=${element.volume.toFixed(3)}, gain=${gainMultiplier.toFixed(3)}`);
+                `native=${element.volume.toFixed(3)}, gain=${effectiveGain.toFixed(3)}`);
         
         return true;
     }
@@ -129,9 +140,98 @@ window.VolumeControl.VolumeController = {};
         
         try {
             const clamped = Math.max(0, Math.min(5, gain));
-            gainNode.gain.setValueAtTime(clamped, audioContext.currentTime);
+            const mask = stateData.gainMask;
+            if (mask && mask.node === gainNode) {
+                // This node is held by a page-write mask: the new gain becomes the one the
+                // release hands back, instead of being written under the mask.
+                mask.savedGain = clamped;
+            } else {
+                gainNode.gain.setValueAtTime(clamped, audioContext.currentTime);
+            }
+            // AudioParam.value can lag a write made in the same render quantum, so the
+            // gain a mask must hand back is remembered instead of being read back.
+            restingGain.set(gainNode, clamped);
         } catch (e) {
             warn(`[VolumeController] Failed to set gain:`, e);
+        }
+    }
+
+    /**
+     * Hold the audible level while a passive page write to element.volume waits for a
+     * decision. Firefox applies element.volume to the output within the next audio block,
+     * so until the managed volume is restored the page's own level is audible. A gain step
+     * made in the same task as the page's write lands in the same audio batch, so the output
+     * never moves; the decision engine later restores native volume and releases the mask.
+     *
+     * The step goes on the first gain node after the source, because that is the only place
+     * where scaling is linear: the pre-compressor gain with the compressor on (the compressor
+     * then sees exactly the signal it would see at the managed volume, so it never dips or
+     * pumps), the main gain node otherwise. It never touches the source, which the
+     * held-gesture rule forbids rewriting during a wait.
+     *
+     * One mask per element: overlapping page writes reuse it and only retarget the step.
+     *
+     * @param {HTMLMediaElement} element - Media element holding the page-written volume
+     * @param {Object} stateData - Element state data
+     * @param {number} volumePercent - Managed target (0-500)
+     * @param {boolean} [compressed] - Whether the compressor is in the connected graph
+     * @returns {Object|null} - Mask token for releasePageVolumeMask, or null if nothing was masked
+     */
+    function maskPageVolumeWrite(element, stateData, volumePercent, compressed = false) {
+        const { audioContext } = stateData || {};
+        const node = compressed ? stateData?.preCompressorGainNode : stateData?.gainNode;
+        // A passthrough graph bypasses the gain nodes, so masking would do nothing.
+        if (!node || !audioContext || stateData.passthroughMode) return null;
+
+        const native = element.volume;
+        if (!(native > MASK_MIN_NATIVE_VOLUME)) return null;
+
+        try {
+            // The audible level is native * gain, and the managed native volume is min(1, target).
+            const scale = Math.min(MASK_MAX_SCALE, Math.min(1, volumePercent / 100) / native);
+            let mask = stateData.gainMask;
+            if (!mask || mask.node !== node) {
+                // A mask on another node (the compressor toggled mid-mask) would otherwise be
+                // orphaned: its release would no-op and that node would stay stepped down.
+                if (mask) {
+                    releasePageVolumeMask(stateData, mask);
+                }
+                // Saved before the first mask write, and from what was last written rather
+                // than from AudioParam.value, which can lag a write in the same audio block.
+                if (!restingGain.has(node)) restingGain.set(node, node.gain.value);
+                mask = { node, savedGain: restingGain.get(node), timer: null };
+                mask.timer = setTimeout(() => releasePageVolumeMask(stateData, mask), MASK_FAILSAFE_MS);
+                stateData.gainMask = mask;
+            }
+            node.gain.setValueAtTime(mask.savedGain * scale, audioContext.currentTime);
+            return mask;
+        } catch (e) {
+            warn(`[VolumeController] Failed to mask page volume write:`, e);
+            return null;
+        }
+    }
+
+    /**
+     * Hand the real gain back once native volume is managed again. With a token, only that
+     * mask is released, so a late caller cannot undo a newer one.
+     * @param {Object} stateData - Element state data
+     * @param {Object} [mask] - Token returned by maskPageVolumeWrite
+     * @returns {boolean} - Whether the saved gain was written back
+     */
+    function releasePageVolumeMask(stateData, mask) {
+        const current = stateData?.gainMask;
+        if (!current || (mask && current !== mask)) return false;
+
+        clearTimeout(current.timer);
+        stateData.gainMask = null;
+        const live = current.node === stateData.gainNode || current.node === stateData.preCompressorGainNode;
+        if (!live || !stateData.audioContext) return false;
+        try {
+            current.node.gain.setValueAtTime(current.savedGain, stateData.audioContext.currentTime);
+            return true;
+        } catch (e) {
+            warn(`[VolumeController] Failed to release page volume mask:`, e);
+            return false;
         }
     }
 
@@ -169,8 +269,7 @@ window.VolumeControl.VolumeController = {};
 
     /**
      * Apply native volume only (for CORS-blocked elements that can't use GainNode)
-     * Native-only paths still set element.volume directly and rely on the player/browser
-     * to honour or clamp values as supported.
+     * HTMLMediaElement.volume is specified as [0, 1]; requests above 100% clamp to 1.0.
      * @param {HTMLMediaElement} element - The media element
      * @param {number} volumePercent - Volume to apply (0-500)
      * @returns {boolean} - Whether volume was applied
@@ -184,7 +283,7 @@ window.VolumeControl.VolumeController = {};
         }
 
         const requestedPercent = Math.max(0, volumePercent);
-        const nativeVolume = requestedPercent / 100;
+        const nativeVolume = Math.min(1, requestedPercent / 100);
         
         try {
             const currentVolume = element.volume;
@@ -223,30 +322,7 @@ window.VolumeControl.VolumeController = {};
      */
     function getEffectiveVolume(element) {
         if (element.muted) return 0;
-        return Math.round(element.volume * 100);
-    }
-
-    /**
-     * Apply volume to all active elements
-     * @param {number} volumePercent - Volume to apply
-     * @param {Map} elementsMap - Map of element -> stateData
-     */
-    function applyToAll(volumePercent, elementsMap) {
-        const timestamp = Date.now();
-        let appliedCount = 0;
-        
-        // Prefer enum state checks to avoid string literal drift.
-        const ElementState = window.VolumeControl.ElementState;
-        elementsMap.forEach((stateData, element) => {
-            if (stateData.state === ElementState.ACTIVE || stateData.gainNode) {
-                if (applyVolume(element, stateData, volumePercent, { timestamp })) {
-                    appliedCount++;
-                }
-            }
-        });
-        
-        log(`[VolumeController] Applied ${volumePercent}% to ${appliedCount} elements`);
-        return appliedCount;
+        return Protocol.nativeVolumeToPercent(element.volume);
     }
 
     // Export
@@ -257,9 +333,10 @@ window.VolumeControl.VolumeController = {};
         applyGainOnly,
         setNativeVolume,
         setGainNode,
+        maskPageVolumeWrite,
+        releasePageVolumeMask,
         applyMute,
-        getEffectiveVolume,
-        applyToAll
+        getEffectiveVolume
     };
 
 })();

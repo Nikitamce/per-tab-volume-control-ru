@@ -67,6 +67,18 @@ body {
   box-sizing: border-box; /* Include padding and border in element's total width and height */
   transition: background var(--transition-fast), color var(--transition-fast);
   overflow: hidden; /* Prevent accidental scrollbars */
+  /* Popup chrome text (labels, status, shortcut cards, etc.) should not highlight on drag. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Keep typing/editing surfaces selectable. */
+input,
+textarea,
+select,
+option {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* --- Header Area --- */
@@ -402,10 +414,10 @@ body {
 
 /* --- Compression Section --- */
 .compression-container {
-  margin-top: 8px;
+  margin-top: 0;
   margin-bottom: 0;
   padding-top: 0;
-  padding-bottom: 5px;
+  padding-bottom: 12px;
   height: auto;
 }
 .compression-header {
@@ -495,20 +507,34 @@ input:checked + .toggle-slider:before {
 .param-control {
   margin-bottom: 10px;
 }
-.param-control label {
+.param-control label,
+.param-control .param-label {
   display: block;
   font-size: 12px;
   margin-bottom: 5px;
   color: var(--text);
   transition: color var(--transition-fast);
   user-select: none;
+  white-space: nowrap;
 }
-.param-control label span {
+.param-control .param-prefix {
+  font-weight: 400;
+  margin-right: 4px;
+}
+.param-control .param-value {
   font-weight: 600;
-  min-width: 25px;
+  min-width: 1.75em;
   display: inline-block;
   text-align: right;
+}
+.param-control .param-unit {
+  font-weight: 400;
   margin-left: 4px;
+}
+.param-control .param-suffix {
+  font-weight: 400;
+  margin-left: 0;
+  white-space: pre; /* keep even " : 1" spacing from the locale string */
 }
 .param-control input[type="range"] {
   width: 100%;
@@ -730,10 +756,80 @@ input:checked + .toggle-slider:before {
 }
 
 .audio-controls-separator {
-  margin-top: 8px;
-  padding-top: 8px;
-  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  margin-bottom: 2px;
+  padding: 2px 0;
+}
+
+.audio-controls-separator-line {
+  flex: 1 1 auto;
+  height: 0;
   border-top: 1px solid var(--border);
+  transition: border-color var(--transition-fast);
+}
+
+.compact-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 18px;
+  min-width: 28px;
+  min-height: 18px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.compact-toggle:hover {
+  background-color: rgba(127, 127, 127, 0.08);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.compact-toggle:focus {
+  outline: none;
+}
+
+.compact-toggle:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.compact-toggle-icon {
+  width: 12px;
+  height: 12px;
+  stroke: currentColor;
+  stroke-width: 2.1;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform var(--transition-fast);
+}
+
+#main-view.compact .compact-toggle-icon {
+  transform: rotate(180deg);
+}
+
+#main-view.compact .panel-tabs-container,
+#main-view.compact .footer-bar {
+  display: none;
+}
+
+body:has(#main-view.compact.active) {
+  padding-bottom: 10px;
 }
 
 .footer-bar {
@@ -1022,7 +1118,8 @@ input:checked + .toggle-slider:before {
 .settings-groups {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
+  padding-bottom: 2px;
 }
 
 .settings-group {
@@ -1040,13 +1137,15 @@ input:checked + .toggle-slider:before {
 
 .settings-group-title {
   margin: 0;
-  padding: 10px 0 8px;
+  padding: 9px 0 6px;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   opacity: 0.82;
   color: var(--text-muted);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .settings-row,
@@ -1059,10 +1158,10 @@ input:checked + .toggle-slider:before {
 .settings-row,
 .settings-link-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 0;
+  padding: 9px 0;
   color: var(--text);
   background: transparent;
   border: none;
@@ -1105,8 +1204,95 @@ input:checked + .toggle-slider:before {
   cursor: pointer;
 }
 
+body.i18n-pending {
+  visibility: hidden;
+}
+
+/* Settings / shortcuts can exceed Firefox popup max height after Language row;
+   keep header fixed and scroll content with an invisible scrollbar. */
+#settings-view.active,
+#shortcuts-view.active {
+  display: flex;
+  flex-direction: column;
+  max-height: 560px;
+  overflow: hidden;
+}
+
+#settings-view .settings-groups,
+#shortcuts-view .shortcuts-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* Legacy Edge */
+}
+
+#settings-view .settings-groups::-webkit-scrollbar,
+#shortcuts-view .shortcuts-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
 .settings-row-with-switch {
+  align-items: flex-start;
+}
+
+.settings-row-with-select {
   align-items: center;
+}
+
+.settings-row-with-switch .settings-switch,
+.settings-row > input[type="checkbox"],
+.settings-inline-toggle > input[type="checkbox"] {
+  margin-top: 1px;
+}
+
+.settings-row-with-select .settings-select {
+  margin-top: 0;
+}
+
+.settings-select {
+  max-width: 148px;
+  min-width: 112px;
+  width: auto;
+  flex-shrink: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  text-overflow: ellipsis;
+  color-scheme: light;
+}
+
+.settings-select:hover,
+.settings-select:focus {
+  border-color: var(--primary);
+  outline: none;
+}
+
+.settings-select option {
+  background-color: var(--background);
+  color: var(--text);
+}
+
+[data-theme="dark"] .settings-select {
+  color-scheme: dark;
+  background: #2b2b2b;
+  border-color: rgba(255, 255, 255, 0.16);
+  color: #f1f3f4;
+}
+
+[data-theme="dark"] .settings-select option {
+  background-color: #2b2b2b;
+  color: #f1f3f4;
 }
 
 .settings-switch {
@@ -1137,26 +1323,34 @@ input:checked + .toggle-slider:before {
 
 .settings-row-copy {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
   min-width: 0;
   flex: 1;
-  flex-wrap: wrap;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .settings-row-label {
   font-size: 12px;
   font-weight: 600;
-  line-height: 1.2;
+  line-height: 1.25;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .settings-row-subtitle {
-  display: inline;
-  margin-top: 0;
+  display: block;
+  margin: 0;
   font-size: 11px;
-  line-height: 1.2;
+  line-height: 1.3;
   color: var(--text-muted);
-  margin-left: 2px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .setting-hint {
@@ -1232,6 +1426,7 @@ input:checked + .toggle-slider:before {
 
 .settings-link-row {
   padding-right: 0;
+  align-items: center;
 }
 
 .settings-link-row:hover {
@@ -1241,6 +1436,8 @@ input:checked + .toggle-slider:before {
 .settings-link-arrow {
   width: 16px;
   height: 16px;
+  flex-shrink: 0;
+  margin-top: 1px;
   stroke: currentColor;
   stroke-width: 2;
   fill: none;
@@ -1281,7 +1478,6 @@ input:checked + .toggle-slider:before {
   margin: 0;
   font-size: 12px;
   line-height: 1.4;
-}
 }
 
 /* ==========================================================================
@@ -1412,7 +1608,7 @@ input:checked + .toggle-slider:before {
   margin-left: 2px;
 }
 
-#compressor-panel .compression-params {
+#compressor-panel .compression-params:not(.hidden) {
   margin-top: 12px;
   padding-left: 2px;
   padding-right: 2px;

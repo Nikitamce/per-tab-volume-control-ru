@@ -6,7 +6,7 @@ window.VolumeControl = window.VolumeControl || {};
 window.VolumeControl.AudioContext = {};
 
 (function() {
-    const { log, warn, error, verbose } = window.VolumeControl;
+    const { log, warn, error } = window.VolumeControl;
 
     /**
      * Ensures AudioContext is running. Handles concurrent resume requests safely.
@@ -38,6 +38,14 @@ window.VolumeControl.AudioContext = {};
         
         log(`AudioContext state is ${audioContext.state}, attempting to resume...`);
         try {
+            let resumeTimeoutId = null;
+            let racedPromise = null;
+            const clearResumeTimeout = () => {
+                if (resumeTimeoutId !== null) {
+                    clearTimeout(resumeTimeoutId);
+                    resumeTimeoutId = null;
+                }
+            };
             const resumePromise = audioContext.resume()
                 .then(() => {
                     // CRITICAL: Check ACTUAL state, not just promise resolution
@@ -65,28 +73,37 @@ window.VolumeControl.AudioContext = {};
                     return audioContext;
                 })
                 .finally(() => {
-                    State.audioContextResumePromise = null;
+                    clearResumeTimeout();
                 });
             
-            State.audioContextResumePromise = Promise.race([
+            racedPromise = Promise.race([
                 resumePromise,
                 new Promise((resolve) => {
-                    setTimeout(() => {
+                    resumeTimeoutId = setTimeout(() => {
+                        resumeTimeoutId = null;
                         const currentState = audioContext.state;
                         if (currentState !== 'running') {
                             warn(`AudioContext resume timed out after 3s, state: ${currentState}`);
                             warn("Waiting for user interaction to complete resume...");
                             window.VolumeControl.AudioContext.setupAutoplayBypassListener();
                         }
-                        State.audioContextResumePromise = null;
+                        if (State.audioContextResumePromise === racedPromise) {
+                            State.audioContextResumePromise = null;
+                        }
                         resolve(audioContext);
                     }, 3000);
                 })
             ]);
-            
-            return await State.audioContextResumePromise;
+
+            State.audioContextResumePromise = racedPromise;
+            try {
+                return await racedPromise;
+            } finally {
+                if (State.audioContextResumePromise === racedPromise) {
+                    State.audioContextResumePromise = null;
+                }
+            }
         } catch (e) {
-            State.audioContextResumePromise = null;
             throw e;
         }
     };
@@ -108,6 +125,11 @@ window.VolumeControl.AudioContext = {};
             State.sharedAudioContext.addEventListener('statechange', async () => {
                 const state = State.sharedAudioContext.state;
                 log(`AudioContext state changed to: ${state}`);
+
+                if (state === 'running') {
+                    window.VolumeControl.Main?.refreshDetectedMediaState?.(null, 'audio-context-running');
+                    return;
+                }
                 
                 if (state === 'suspended' || state === 'interrupted') {
                     warn(`AudioContext ${state} - attempting immediate resume`);
@@ -116,33 +138,13 @@ window.VolumeControl.AudioContext = {};
                         await State.sharedAudioContext.resume();
                         log(`AudioContext resumed from ${state}, new state: ${State.sharedAudioContext.state}`);
                         
-                        // Mark elements needing verification using new architecture
-                        const elementStateManager = window.VolumeControl.elementStateManager;
-                        if (elementStateManager) {
-                            elementStateManager.getActive().forEach(({ element, stateData }) => {
-                                const isPlaying = !element.paused && !element.ended && element.currentTime > 0;
-                                if (isPlaying) {
-                                    stateData.needsConnectionVerification = true;
-                                }
-                            });
-                        }
-                        
-                        // Trigger repair through Main module
-                        if (window.VolumeControl.Main && window.VolumeControl.Main.repairAllElements) {
-                            window.VolumeControl.Main.repairAllElements();
-                        }
+                        // Flag and repair through Main, which owns the one eligibility rule
+                        // (ACTIVE, not passthrough, extension enabled, playing).
+                        window.VolumeControl.Main?.repairAllElements?.({ markEligible: true });
                     } catch (e) {
                         error(`Failed to resume AudioContext from ${state}:`, e);
-                        // Mark elements for retry using new architecture
-                        const elementStateManager = window.VolumeControl.elementStateManager;
-                        if (elementStateManager) {
-                            elementStateManager.getActive().forEach(({ element, stateData }) => {
-                                const isPlaying = !element.paused && !element.ended && element.currentTime > 0;
-                                if (isPlaying) {
-                                    stateData.needsConnectionVerification = true;
-                                }
-                            });
-                        }
+                        // Flag eligible elements for retry without repairing them yet.
+                        window.VolumeControl.Main?.repairAllElements?.({ markEligible: true, repair: false });
                     }
                 }
             });
@@ -166,39 +168,11 @@ window.VolumeControl.AudioContext = {};
                                 log(`AudioContext resume attempt complete, state: ${newState}`);
                                 
                                 if (newState === 'running') {
-                                    // Repair all active elements
-                                    if (window.VolumeControl.Main && window.VolumeControl.Main.repairAllElements) {
-                                        const repaired = window.VolumeControl.Main.repairAllElements();
-                                        if (repaired > 0) {
-                                            log(`✓ Repaired ${repaired} elements after tab focus`);
-                                        }
-                                    }
-                                    
-                                    // Also update new architecture elements
-                                    const elementStateManager = window.VolumeControl.elementStateManager;
-                                    const VolumeSyncManager = window.VolumeControl.volumeSyncManager;
-                                    if (elementStateManager) {
-                                        const VolumeController = window.VolumeControl.VolumeController;
-                                        const State = window.VolumeControl.State;
-                                        
-                                        elementStateManager.getActive().forEach(({ element, stateData }) => {
-                                            const isPlaying = !element.paused && !element.ended && element.currentTime > 0;
-                                            
-                                            if (isPlaying && VolumeController) {
-                                                // Mark that we're applying volume to prevent hijack false positives
-                                                if (VolumeSyncManager) {
-                                                    VolumeSyncManager.startApplyingVolume(element, State.currentVolumePercent);
-                                                }
-                                                // Force re-apply volume to ensure it sticks after AudioContext resume
-                                                VolumeController.applyVolume(
-                                                    element, 
-                                                    stateData, 
-                                                    State.currentVolumePercent,
-                                                    { force: true }
-                                                );
-                                                verbose(`Reapplied volume to ${element.tagName} after AudioContext resume`);
-                                            }
-                                        });
+                                    // One shared repair path: Main flags the eligible elements and
+                                    // repairs them (owned volume, gain-only otherwise).
+                                    const repaired = window.VolumeControl.Main?.repairAllElements?.({ markEligible: true });
+                                    if (repaired > 0) {
+                                        log(`✓ Repaired ${repaired} elements after tab focus`);
                                     }
                                 }
                             } catch (e) {
@@ -281,7 +255,7 @@ window.VolumeControl.AudioContext = {};
                 
                 // Trigger repair through Main module
                 if (window.VolumeControl.Main && window.VolumeControl.Main.repairAllElements) {
-                    const repairedCount = window.VolumeControl.Main.repairAllElements();
+                    const repairedCount = window.VolumeControl.Main.repairAllElements({ markEligible: true });
                     if (repairedCount > 0) {
                         log(`✓ Repaired ${repairedCount} elements after autoplay bypass`);
                     }

@@ -5,7 +5,9 @@
  */
 
 const Protocol = globalThis.VCProtocol;
+const I18n = globalThis.VCI18n;
 const { Messages, PreferenceKeys } = Protocol;
+const EXTENSION_DISPLAY_NAME = 'Per-Tab Volume Control';
 
 // ============================================
 // Constants - Centralized for consistency
@@ -19,7 +21,6 @@ const CONSTANTS = {
     
     // Icon
     BADGE_DEBOUNCE_MS: 50,
-    MAX_ICON_CACHE_SIZE: 50,
     
     // State Hydration
     HYDRATE_TTL_MS: 30_000,
@@ -33,7 +34,12 @@ const tabState = new Map();
 // Prefer session storage when available; fall back to local.
 const storageArea = (browser?.storage?.session) ? browser.storage.session : browser.storage.local;
 let persistTimer = null;
-const persistDirtyTabIds = new Set();
+// Dirty tab ids map to the generation of their latest mark. A flush clears an id only when its
+// generation is unchanged since the state was serialised, so a re-dirtied id is never dropped.
+const persistDirtyTabIds = new Map();
+let persistGeneration = 0;
+let persistFlushChain = Promise.resolve();
+let tabStateRestorePromise = null;
 const LEGACY_PREFERENCE_STORAGE_KEYS = [
     'rememberCompressionBySite',
     'rememberMonoBySite',
@@ -53,6 +59,9 @@ function serializeTabStateForStorage(state) {
     if (!state) return null;
     return {
         volume: normalizeVolume(state.volume, CONSTANTS.DEFAULT_VOLUME),
+        // Always an explicit control (unmanaged revision 0 for a tab without one), so a restore can
+        // tell a telemetry-only tab from an entry written before explicit controls existed (ISS-003).
+        volumeControl: getTabVolumeControl(state),
         extensionEnabled: typeof state.extensionEnabled === 'boolean' ? state.extensionEnabled : true,
         monoEnabled: Boolean(state.monoEnabled),
         balance: Protocol.normalizeBalance(state.balance, CONSTANTS.DEFAULT_BALANCE),
@@ -66,91 +75,279 @@ function serializeTabStateForStorage(state) {
         audioSettingsAvailable: typeof state.audioSettingsAvailable === 'boolean' ? state.audioSettingsAvailable : true,
         audioSettingsReason: state.audioSettingsReason ?? null,
         statusDetail: state.statusDetail ?? null,
-        lastSeenAt: (typeof state.lastSeenAt === 'number') ? state.lastSeenAt : Date.now(),
+        // A record without a stamp stays without one: stamping Date.now here would make a
+        // reverted husk look fresh after a cold wake and defeat the staleness checks. Readers
+        // already treat a missing stamp as stale, and the format stays additive (G11).
+        lastSeenAt: (typeof state.lastSeenAt === 'number') ? state.lastSeenAt : undefined,
         lastMediaSeenAt: (typeof state.lastMediaSeenAt === 'number') ? state.lastMediaSeenAt : undefined,
         hasMedia: Boolean(state.hasMedia),
         status: state.status
     };
 }
 
-function schedulePersistTabState(tabId) {
-    if (!tabId) return;
-    persistDirtyTabIds.add(String(tabId));
+function markTabStateDirty(tabId) {
+    persistGeneration += 1;
+    persistDirtyTabIds.set(String(tabId), persistGeneration);
+}
+
+function armPersistTimer() {
     if (persistTimer) return;
     persistTimer = setTimeout(() => {
         persistTimer = null;
-        flushPersistedTabState().catch(() => {});
+        flushPersistedTabState().catch((error) => {
+            console.error('persist tab state failed:', error);
+        });
     }, CONSTANTS.STATE_PERSIST_DEBOUNCE_MS);
 }
 
+function schedulePersistTabState(tabId) {
+    if (!tabId) return;
+    markTabStateDirty(tabId);
+    armPersistTimer();
+}
+
 async function flushPersistedTabState() {
-    if (persistDirtyTabIds.size === 0) return;
-
-    const dirty = Array.from(persistDirtyTabIds);
-    persistDirtyTabIds.clear();
-
-    const existing = (await storageArea.get(CONSTANTS.STATE_STORAGE_KEY))[CONSTANTS.STATE_STORAGE_KEY] || {};
-    for (const id of dirty) {
-        const tabId = Number(id);
-        const state = tabState.get(tabId);
-        if (state) {
-            existing[id] = serializeTabStateForStorage(state);
-        } else {
-            delete existing[id];
+    const run = async () => {
+        if (persistDirtyTabIds.size === 0) {
+            return;
         }
-    }
 
-    await storageArea.set({ [CONSTANTS.STATE_STORAGE_KEY]: existing });
+        const existing = (await storageArea.get(CONSTANTS.STATE_STORAGE_KEY))[CONSTANTS.STATE_STORAGE_KEY] || {};
+        // Snapshot in the same synchronous step that serialises, so the recorded generation
+        // describes exactly the state that is written.
+        const written = new Map(persistDirtyTabIds);
+        for (const id of written.keys()) {
+            const tabId = Number(id);
+            const state = tabState.get(tabId);
+            if (state) {
+                existing[id] = serializeTabStateForStorage(state);
+            } else {
+                delete existing[id];
+            }
+        }
+
+        await storageArea.set({ [CONSTANTS.STATE_STORAGE_KEY]: existing });
+        for (const [id, generation] of written) {
+            if (persistDirtyTabIds.get(id) === generation) {
+                persistDirtyTabIds.delete(id);
+            }
+        }
+        // Ids re-dirtied during the write are retained; make sure a later flush picks them up.
+        // A failed write throws above, so a failing store is never retried in a loop.
+        if (persistDirtyTabIds.size > 0) {
+            armPersistTimer();
+        }
+    };
+
+    persistFlushChain = persistFlushChain.then(run, run);
+    return persistFlushChain;
 }
 
 async function removePersistedTabState(tabId) {
-    try {
-        const key = String(tabId);
+    const run = async () => {
+        try {
+            const key = String(tabId);
+            const existing = (await storageArea.get(CONSTANTS.STATE_STORAGE_KEY))[CONSTANTS.STATE_STORAGE_KEY] || {};
+            if (Object.prototype.hasOwnProperty.call(existing, key)) {
+                delete existing[key];
+                await storageArea.set({ [CONSTANTS.STATE_STORAGE_KEY]: existing });
+            }
+        } catch {
+            // ignore
+        }
+    };
+    persistFlushChain = persistFlushChain.then(run, run);
+    return persistFlushChain;
+}
+
+// Chained read-modify-write so the restore prune cannot interleave with, or overwrite, a flush.
+// Errors propagate to the caller so a failed prune keeps restore uncached and retryable.
+function prunePersistedTabState(closedKeys) {
+    const run = async () => {
         const existing = (await storageArea.get(CONSTANTS.STATE_STORAGE_KEY))[CONSTANTS.STATE_STORAGE_KEY] || {};
-        if (Object.prototype.hasOwnProperty.call(existing, key)) {
-            delete existing[key];
+        let removed = false;
+        for (const key of closedKeys) {
+            if (Object.prototype.hasOwnProperty.call(existing, key)) {
+                delete existing[key];
+                removed = true;
+            }
+        }
+        if (removed) {
             await storageArea.set({ [CONSTANTS.STATE_STORAGE_KEY]: existing });
         }
-    } catch {
-        // ignore
+    };
+    persistFlushChain = persistFlushChain.then(run, run);
+    return persistFlushChain;
+}
+
+function pickPreferredVolumeControl(liveControl, persistedControl) {
+    const live = liveControl
+        ? Protocol.normalizeVolumeControl(liveControl)
+        : null;
+    const persisted = persistedControl
+        ? Protocol.normalizeVolumeControl(persistedControl)
+        : null;
+    if (!live) {
+        return persisted;
     }
+    if (!persisted) {
+        return live;
+    }
+    const liveRevision = Math.floor(Number(live.revision) || 0);
+    const persistedRevision = Math.floor(Number(persisted.revision) || 0);
+    return liveRevision >= persistedRevision ? live : persisted;
+}
+
+// Values a writer gives a record it creates before the restore has run. They carry no knowledge
+// of the tab, so a persisted value always outranks them in the restore merge.
+const TAB_STATE_SEED_DEFAULTS = Object.freeze({
+    volume: CONSTANTS.DEFAULT_VOLUME,
+    corsAffectedCount: 0,
+    status: 'no-media',
+    hasMedia: false
+});
+
+// Field-wise merge of a record written since wake (`live`) with its persisted snapshot. Fields the
+// live writer set win, fields it left absent or at a seed default come from the snapshot, and the
+// volume control follows `pickPreferredVolumeControl` so a managed target also sets the volume.
+function mergeRestoredTabState(live, persisted) {
+    const merged = { ...persisted };
+    for (const [key, value] of Object.entries(live)) {
+        if (value === undefined) continue;
+        const isSeedDefault = Object.prototype.hasOwnProperty.call(TAB_STATE_SEED_DEFAULTS, key) &&
+            value === TAB_STATE_SEED_DEFAULTS[key];
+        if (isSeedDefault && persisted[key] !== undefined) continue;
+        merged[key] = value;
+    }
+    merged.volumeControl = pickPreferredVolumeControl(live.volumeControl, persisted.volumeControl);
+    if (Protocol.isManagedVolumeControl(merged.volumeControl)) {
+        merged.volume = merged.volumeControl.targetVolume;
+    }
+    return merged;
+}
+
+// ISS-003: an entry written by a build that predates explicit controls has no `volumeControl` key
+// and a managed target in `volume`. Only that shape migrates, once, to a managed LEGACY revision 1
+// control. Every current build writes the key (an unmanaged control for plain telemetry), so an entry
+// that has the key is never migrated and page telemetry cannot be promoted by a wake. The migrated
+// control lives on the restored record and is written back by its next ordinary flush.
+function migrateKeylessPersistedVolumeControl(persisted) {
+    if (Object.prototype.hasOwnProperty.call(persisted, 'volumeControl')) {
+        return persisted;
+    }
+    const volume = normalizeVolume(persisted.volume, CONSTANTS.DEFAULT_VOLUME);
+    if (volume === CONSTANTS.DEFAULT_VOLUME) {
+        return persisted;
+    }
+    return {
+        ...persisted,
+        volumeControl: Protocol.createManagedVolumeControl(volume, Protocol.VolumeControlSource.LEGACY, 1)
+    };
 }
 
 async function restoreTabStateFromStorage() {
+    await persistFlushChain.catch(() => {});
     const stored = (await storageArea.get(CONSTANTS.STATE_STORAGE_KEY))[CONSTANTS.STATE_STORAGE_KEY] || {};
     const tabs = await browser.tabs.query({});
     const openIds = new Set(tabs.filter(t => t?.id).map(t => String(t.id)));
 
     // Prune stored entries for closed tabs
-    let changed = false;
+    const closedKeys = [];
     for (const key of Object.keys(stored)) {
         if (!openIds.has(key)) {
             delete stored[key];
-            changed = true;
+            closedKeys.push(key);
         }
     }
 
-    // Seed in-memory state
+    // Seed in-memory state. Live commits since wake win over persisted snapshots.
     for (const tab of tabs) {
         if (!tab?.id) continue;
         const key = String(tab.id);
         const prev = tabState.get(tab.id) || {};
-        const persisted = stored[key];
-        if (!persisted) continue;
+        const storedEntry = stored[key];
+        if (!storedEntry) continue;
+        const persisted = migrateKeylessPersistedVolumeControl(storedEntry);
 
-        tabState.set(tab.id, {
-            ...prev,
-            ...persisted,
-            title: tab.title || prev.title || 'Unknown Tab',
-            favIconUrl: tab.favIconUrl || prev.favIconUrl || '',
-            url: tab.url || prev.url || '',
-            windowId: tab.windowId
+        const merged = mergeRestoredTabState(prev, persisted);
+        merged.title = tab.title || prev.title || '';
+        merged.favIconUrl = tab.favIconUrl || prev.favIconUrl || '';
+        merged.url = tab.url || prev.url || '';
+        merged.windowId = tab.windowId;
+        tabState.set(tab.id, merged);
+    }
+
+    if (closedKeys.length > 0) {
+        await prunePersistedTabState(closedKeys);
+    }
+}
+
+function ensureTabStateRestored() {
+    if (!tabStateRestorePromise) {
+        tabStateRestorePromise = restoreTabStateFromStorage().catch((error) => {
+            tabStateRestorePromise = null;
+            throw error;
         });
     }
+    return tabStateRestorePromise;
+}
 
-    if (changed) {
-        await storageArea.set({ [CONSTANTS.STATE_STORAGE_KEY]: stored });
+// Restore barrier for every entry that reads or writes `tabState` and must still run when storage
+// fails. A rejected restore is logged and not cached (see ensureTabStateRestored), so a later
+// caller retries it while this command carries on with the in-memory state.
+async function ensureTabStateRestoredOrLog() {
+    try {
+        await ensureTabStateRestored();
+        return true;
+    } catch (error) {
+        console.warn('Tab state restore failed; continuing with in-memory state:', error);
+        return false;
     }
+}
+
+// ISS-005: ids of tabs closed during this session. Firefox does not reuse a tab id within a
+// session, so an async writer that resumes after a close can skip by id alone, with no
+// `tabs.get` round trip. The set is bounded; the oldest id is dropped first.
+const RECENTLY_CLOSED_TAB_CAP = 200;
+const recentlyClosedTabIds = new Set();
+
+function markTabClosed(tabId) {
+    recentlyClosedTabIds.delete(tabId);
+    recentlyClosedTabIds.add(tabId);
+    while (recentlyClosedTabIds.size > RECENTLY_CLOSED_TAB_CAP) {
+        recentlyClosedTabIds.delete(recentlyClosedTabIds.values().next().value);
+    }
+}
+
+function isTabClosed(tabId) {
+    return recentlyClosedTabIds.has(tabId);
+}
+
+// ISS-005: background mute and enable commands being delivered to a tab, counted per tab. While a
+// delivery is in flight the record already holds the commanded value, so page telemetry that was
+// captured earlier must not overwrite `muted`, `volumeBeforeMute` or `extensionEnabled`. The guard
+// ends with the delivery: a later STATUS_UPDATE (a player-UI unmute arrives only that way) applies.
+const commandDeliveriesInFlight = new Map();
+
+function beginCommandDelivery(tabId) {
+    commandDeliveriesInFlight.set(tabId, (commandDeliveriesInFlight.get(tabId) || 0) + 1);
+}
+
+function endCommandDelivery(tabId) {
+    const remaining = (commandDeliveriesInFlight.get(tabId) || 0) - 1;
+    if (remaining > 0) {
+        commandDeliveriesInFlight.set(tabId, remaining);
+    } else {
+        commandDeliveriesInFlight.delete(tabId);
+    }
+}
+
+function isCommandDeliveryInFlight(tabId) {
+    return commandDeliveriesInFlight.has(tabId);
+}
+
+function isContentScriptSender(sender) {
+    return Boolean(sender?.tab);
 }
 
 async function getFrameStatusPayloads(tabId) {
@@ -173,22 +370,82 @@ async function getFrameStatusPayloads(tabId) {
         .filter((result) => Boolean(result.payload));
 }
 
-async function installPageMediaBridge(tabId, frameId) {
-    if (!tabId || typeof frameId !== 'number') {
-        return false;
+function getTabVolumeControl(state) {
+    if (!state) {
+        return Protocol.createUnmanagedVolumeControl();
     }
-
-    const results = await browser.scripting.executeScript({
-        target: { tabId, frameIds: [frameId] },
-        world: 'MAIN',
-        injectImmediately: true,
-        files: ['content_scripts/page/media_play_bridge.js']
-    });
-
-    return (results || []).some((result) => result?.result?.installed === true || result?.result?.alreadyInstalled === true);
+    if (state.volumeControl) {
+        return Protocol.normalizeVolumeControl(state.volumeControl, state.volume);
+    }
+    // A record without a stored control is unmanaged whatever its volume: `volume` is page telemetry
+    // there, and telemetry is never promoted to a managed target (ISS-003).
+    return Protocol.createUnmanagedVolumeControl(normalizeVolume(state.volume, CONSTANTS.DEFAULT_VOLUME));
 }
 
-function mergeFrameStatusPayloads(framePayloads) {
+function resolveTabAuthoritativeVolume(state, telemetryVolume) {
+    const volumeControl = getTabVolumeControl(state);
+    return Protocol.resolveAuthoritativeVolume(
+        volumeControl,
+        telemetryVolume,
+        state?.volume ?? CONSTANTS.DEFAULT_VOLUME
+    );
+}
+
+async function commitTabVolumeControl(tabId, control, options = {}) {
+    if (isTabClosed(tabId)) {
+        // A late commit for a closed tab must not re-create its record.
+        return { accepted: false, control: Protocol.createUnmanagedVolumeControl() };
+    }
+    const immediate = options.immediate !== false;
+    const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
+    const current = getTabVolumeControl(state);
+    const normalized = Protocol.normalizeVolumeControl(control, state.volume);
+
+    if (Protocol.volumeControlsEqual(current, normalized)) {
+        return { accepted: true, control: current, unchanged: true };
+    }
+
+    if (!Protocol.shouldAcceptVolumeControlUpdate(current, normalized, { allowEqualDifferent: false })) {
+        return { accepted: false, control: current };
+    }
+
+    // Snapshot before mutating, so a failed immediate flush can put the prior record back
+    // instead of leaving a control the page was never told about (G2: the revert only applies
+    // while the record still holds exactly this commit, so a newer win is never undone).
+    const priorFields = snapshotVolumeCommitFields(state);
+    state.volumeControl = normalized;
+    if (Protocol.isManagedVolumeControl(normalized)) {
+        state.volume = normalized.targetVolume;
+        if (state.muted) {
+            state.volumeBeforeMute = normalized.targetVolume;
+        }
+    }
+    state.lastSeenAt = Date.now();
+    tabState.set(tabId, state);
+
+    markTabStateDirty(tabId);
+    if (immediate) {
+        try {
+            await flushPersistedTabState();
+        } catch (error) {
+            // The in-memory record changed before the write failed and the command is not
+            // delivered on this path, so undo the commit instead of claiming an unstored
+            // control. A newer control that landed meanwhile is left alone (G2).
+            await revertUndeliveredVolumeCommit(tabId, normalized, priorFields);
+            throw error;
+        }
+    } else {
+        schedulePersistTabState(tabId);
+    }
+
+    if (options.updateIcon !== false) {
+        debouncedUpdateIcon(tabId, state.volume, state.corsAffectedCount ?? 0);
+    }
+
+    return { accepted: true, control: normalized };
+}
+
+function mergeFrameStatusPayloads(framePayloads, tabId) {
     const defaults = {
         status: 'no-media',
         statusDetail: null,
@@ -206,11 +463,14 @@ function mergeFrameStatusPayloads(framePayloads) {
         audioSettingsReason: null,
         elementCounts: { total: 0 }
     };
-    return Protocol.mergeStatusPayloads(framePayloads, defaults);
+    const volumeControl = tabId ? getTabVolumeControl(tabState.get(tabId)) : null;
+    return Protocol.mergeStatusPayloads(framePayloads, defaults, volumeControl);
 }
 
 const frameStatusCache = new Map();
 
+// Cached frame payloads carry when they were last reported, so a recovered main frame can tell a
+// live sibling from one that went silent (a missed removal or a probe that found no frames).
 function mergeCachedFrameStatusPayload(tabId, frameId, framePayload) {
     let frameMap = frameStatusCache.get(tabId);
     if (!frameMap) {
@@ -218,15 +478,16 @@ function mergeCachedFrameStatusPayload(tabId, frameId, framePayload) {
         frameStatusCache.set(tabId, frameMap);
     }
 
-    frameMap.set(frameId, framePayload);
-    return mergeFrameStatusPayloads(Array.from(frameMap.values()));
+    frameMap.set(frameId, { payload: framePayload, receivedAt: Date.now() });
+    return mergeFrameStatusPayloads(Array.from(frameMap.values()), tabId);
 }
 
 function replaceCachedFrameStatusPayloads(tabId, framePayloads) {
     const frameMap = new Map();
+    const now = Date.now();
     (framePayloads || []).forEach((framePayload, index) => {
         const frameId = typeof framePayload?.frameId === 'number' ? framePayload.frameId : index;
-        frameMap.set(frameId, framePayload?.payload ?? framePayload);
+        frameMap.set(frameId, { payload: framePayload?.payload ?? framePayload, receivedAt: now });
     });
     frameStatusCache.set(tabId, frameMap);
 }
@@ -235,31 +496,88 @@ function clearCachedFrameStatusPayloads(tabId) {
     frameStatusCache.delete(tabId);
 }
 
-function mergedStatusHasMedia(merged) {
-    return Protocol.statusPayloadHasMedia(merged);
+function removeCachedFrameStatusPayload(tabId, frameId) {
+    const frameMap = frameStatusCache.get(tabId);
+    if (!frameMap) {
+        return false;
+    }
+
+    const removed = frameMap.delete(frameId);
+    if (frameMap.size === 0) {
+        frameStatusCache.delete(tabId);
+    }
+    return removed;
 }
 
-function getNextLastMediaSeenAt(previousState, hasMedia, status) {
-    if (!hasMedia) {
-        return previousState?.lastMediaSeenAt;
-    }
+function mergedStatusHasMedia(merged) {
+    return Boolean(Protocol.statusPayloadHasMedia(merged));
+}
 
-    if (typeof previousState?.lastMediaSeenAt !== 'number') {
-        return Date.now();
-    }
+// ISS-006: a record that already saw media (or native-only elements) carries knowledge that the
+// frame cache lost when the event page was suspended.
+function recordHadMedia(state) {
+    return state?.hasMedia === true || normalizeCorsCount(state?.corsAffectedCount) > 0;
+}
 
-    if (!previousState?.hasMedia) {
-        return Date.now();
-    }
+// A main-frame report that carries healthy media of its own. Used to spot a merge that still
+// claims a limitation the main frame does not report.
+function isHealthyMainFramePayload(own) {
+    if (!own || typeof own !== 'object') return false;
+    if (own.status !== 'active' && own.status !== 'inactive') return false;
+    if (own.statusDetail === 'limited') return false;
+    if (normalizeCorsCount(own.corsAffectedCount) !== 0) return false;
+    return true;
+}
 
-    if (status === 'active' && previousState.status !== 'active') {
-        return Date.now();
+// Drops cached frames other than `exceptFrameId` that last reported longer than a hydrate
+// interval ago. Fresh siblings (a live multi-frame player) are kept. Returns what was dropped.
+function evictStaleCachedFramePayloads(tabId, exceptFrameId) {
+    const frameMap = frameStatusCache.get(tabId);
+    if (!frameMap) return false;
+    const now = Date.now();
+    let dropped = false;
+    for (const [cachedFrameId, entry] of frameMap) {
+        if (cachedFrameId === exceptFrameId) continue;
+        const receivedAt = typeof entry?.receivedAt === 'number' ? entry.receivedAt : now;
+        if (now - receivedAt > CONSTANTS.HYDRATE_TTL_MS) {
+            frameMap.delete(cachedFrameId);
+            dropped = true;
+        }
     }
+    if (frameMap.size === 0) {
+        frameStatusCache.delete(tabId);
+    }
+    return dropped;
+}
 
-    return previousState.lastMediaSeenAt;
+// Every status that reports media refreshes the stamp, so continuous playback never ages out of
+// `getTabsWithAudio` while a tab that stopped reporting media does, after `RECENT_MEDIA_TTL_MS`.
+function getNextLastMediaSeenAt(previousState, hasMedia) {
+    return hasMedia ? Date.now() : previousState?.lastMediaSeenAt;
+}
+
+// Folds a `tabs` audible signal into the media fields. Silence is not proof that media is gone:
+// frames that reported media keep it, but the audible-derived `active` is dropped and the caller
+// schedules a probe. `fresh` is true when the result comes from current evidence, so only then
+// may it refresh `lastMediaSeenAt`.
+function resolveAudibleHint(tabId, prev, audible) {
+    if (audible) {
+        return { hasMedia: true, status: 'active', fresh: true };
+    }
+    const frames = frameStatusCache.get(tabId);
+    const fromFrames = Boolean(frames && frames.size > 0);
+    const hasMedia = fromFrames
+        ? mergedStatusHasMedia(mergeFrameStatusPayloads(Array.from(frames.values()), tabId))
+        : (prev.status !== 'active' && prev.hasMedia === true);
+    const status = prev.status === 'active'
+        ? (hasMedia ? 'inactive' : 'no-media')
+        : (prev.status || 'no-media');
+    return { hasMedia, status, fresh: fromFrames };
 }
 
 async function probeTabStatus(tabId) {
+    await ensureTabStateRestoredOrLog();
+    if (isTabClosed(tabId)) return null;
     const tab = await browser.tabs.get(tabId).catch(() => null);
     if (!tab?.id) return null;
     if (!tab.url || !/^(https?|file):/i.test(tab.url)) return null;
@@ -267,35 +585,44 @@ async function probeTabStatus(tabId) {
     try {
         const framePayloads = await getFrameStatusPayloads(tab.id);
         if (framePayloads.length === 0) return null;
+        // The tab can close while the frames are queried; a late result must not re-create it.
+        if (isTabClosed(tab.id)) return null;
         replaceCachedFrameStatusPayloads(tab.id, framePayloads);
-        const merged = mergeFrameStatusPayloads(framePayloads);
+        const merged = mergeFrameStatusPayloads(framePayloads, tab.id);
         const hasMedia = mergedStatusHasMedia(merged);
-        const nextVolume = normalizeVolume(merged.volume, CONSTANTS.DEFAULT_VOLUME);
+        const prev = tabState.get(tab.id) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
+        const commandInFlight = isCommandDeliveryInFlight(tab.id);
+        const nextVolume = resolveTabAuthoritativeVolume(prev, merged.observedVolume ?? merged.volume);
         const nextCors = normalizeCorsCount(merged.corsAffectedCount);
 
-        const prev = tabState.get(tab.id) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
         tabState.set(tab.id, {
             ...prev,
-            title: tab.title || prev.title || 'Unknown Tab',
+            title: tab.title || prev.title || '',
             favIconUrl: tab.favIconUrl || prev.favIconUrl || '',
             url: tab.url || prev.url || '',
             windowId: tab.windowId,
             volume: nextVolume,
-            extensionEnabled: merged.extensionEnabled ?? prev.extensionEnabled ?? true,
-            muted: merged.muted ?? prev.muted ?? false,
+            // Telemetry captured before a command in flight must not revert the commanded value.
+            extensionEnabled: commandInFlight
+                ? (prev.extensionEnabled ?? true)
+                : (merged.extensionEnabled ?? prev.extensionEnabled ?? true),
+            muted: commandInFlight ? (prev.muted ?? false) : (merged.muted ?? prev.muted ?? false),
             monoEnabled: merged.monoEnabled ?? prev.monoEnabled,
             balance: merged.balance ?? prev.balance,
             corsAffectedCount: nextCors,
             status: merged.status,
-            statusDetail: merged.statusDetail ?? prev.statusDetail ?? null,
+            // Explicit null must clear transitional details like "setting-up".
+            statusDetail: Protocol.coalesceExplicit(merged.statusDetail, prev.statusDetail, null),
             hasMedia,
             compressionEnabled: merged.compressionEnabled ?? prev.compressionEnabled,
             compressionThreshold: merged.compressionThreshold ?? prev.compressionThreshold,
             compressionRatio: merged.compressionRatio ?? prev.compressionRatio,
             compressionKnee: merged.compressionKnee ?? prev.compressionKnee,
             audioSettingsAvailable: merged.audioSettingsAvailable ?? prev.audioSettingsAvailable ?? true,
-            audioSettingsReason: merged.audioSettingsReason ?? prev.audioSettingsReason ?? null,
-            lastMediaSeenAt: getNextLastMediaSeenAt(prev, hasMedia, merged.status),
+            audioSettingsReason: (merged.audioSettingsAvailable ?? prev.audioSettingsAvailable ?? true)
+                ? null
+                : Protocol.coalesceExplicit(merged.audioSettingsReason, prev.audioSettingsReason, null),
+            lastMediaSeenAt: getNextLastMediaSeenAt(prev, hasMedia),
             lastSeenAt: Date.now()
         });
 
@@ -310,10 +637,11 @@ async function probeTabStatus(tabId) {
 }
 
 function getTabStatusPayloadFromState(state) {
+    const volumeControl = getTabVolumeControl(state);
     return Protocol.normalizeStatusPayload({
         status: state?.status || 'inactive',
         statusDetail: state?.statusDetail ?? null,
-        volume: state?.volume ?? CONSTANTS.DEFAULT_VOLUME,
+        volume: resolveTabAuthoritativeVolume(state, state?.volume),
         extensionEnabled: state?.extensionEnabled ?? true,
         muted: state?.muted ?? false,
         monoEnabled: state?.monoEnabled ?? CONSTANTS.DEFAULT_MONO_ENABLED,
@@ -387,7 +715,7 @@ function formatBadgeText(volume, showDefault = false) {
         return '';
     }
 
-    return String(Math.round(safeVolume));
+    return String(safeVolume);
 }
 
 function getBadgeBackgroundColor(tabId) {
@@ -438,15 +766,24 @@ async function updateIcon(tabId, volume, corsCount, options = {}) {
         });
         
         // Update tooltip
-        let title = `Per-Tab Volume Control: ${Math.round(displayVolume)}%`;
+        const translate = (key, subs) => (I18n?.t ? I18n.t(key, subs) : key);
+        const translatePlural = (baseKey, count, subs) => (
+            I18n?.tPlural
+                ? I18n.tPlural(baseKey, count, subs)
+                : `${baseKey}.other`
+        );
+        let title = translate('toolbar.title', {
+            name: EXTENSION_DISPLAY_NAME,
+            volume: Math.round(displayVolume)
+        });
         if (state?.muted && state?.extensionEnabled !== false) {
-            title += ' (muted)';
+            title += translate('toolbar.mutedSuffix');
         }
         // Only show the native-only warning when it actually matters to the user (boost > 100%)
         if (safeCors > 0 && displayVolume > CONSTANTS.DEFAULT_VOLUME) {
-            title += `\n⚠️ ${safeCors} CORS-limited media element${safeCors > 1 ? 's are' : ' is'} using native-only fallback`;
+            title += `\n${translatePlural('toolbar.corsWarning', safeCors, { count: safeCors })}`;
         }
-        browser.action.setTitle({
+        await browser.action.setTitle({
             title: title,
             tabId: tabId
         });
@@ -482,7 +819,7 @@ function debouncedUpdateIcon(tabId, volume, corsCount) {
 }
 
 function scheduleProbeTabStatus(tabId, delayMs = 120) {
-    if (!tabId) {
+    if (!tabId || isTabClosed(tabId)) {
         return;
     }
 
@@ -498,26 +835,14 @@ function scheduleProbeTabStatus(tabId, delayMs = 120) {
     probeTimers.set(tabId, timer);
 }
 
-/**
- * Update tab info (title, favicon, url) for a tab
- * @param {number} tabId - The tab ID
- */
-async function updateTabInfo(tabId) {
-    try {
-        const tab = await browser.tabs.get(tabId);
-        const state = tabState.get(tabId);
-        if (state && tab) {
-            state.title = tab.title || 'Unknown Tab';
-            state.favIconUrl = tab.favIconUrl || '';
-            state.url = tab.url || '';
-            state.windowId = tab.windowId;
-            tabState.set(tabId, state);
-        }
-    } catch (error) {
-        // Tab might have been closed
-        if (!error.message?.includes('Invalid tab ID')) {
-            console.error("Failed to get tab info:", error);
-        }
+// ISS-006: a frame went away and the cache holds nothing for the tab (the event page was woken
+// since the cache was filled). The record is only readable after the restore (G3); when it saw
+// media the frames are asked again, because the removed frame may have been the one that held it.
+async function scheduleProbeForColdFrameRemoval(tabId) {
+    await ensureTabStateRestoredOrLog();
+    if (isTabClosed(tabId) || frameStatusCache.has(tabId)) return;
+    if (tabState.get(tabId)?.hasMedia === true) {
+        scheduleProbeTabStatus(tabId, 50);
     }
 }
 
@@ -527,6 +852,7 @@ async function updateTabInfo(tabId) {
  * @returns {Array} Array of tab info objects
  */
 async function getTabsWithAudio(excludeTabId = null) {
+    await ensureTabStateRestoredOrLog();
     const tabsWithAudio = [];
 
     const included = new Set();
@@ -540,7 +866,7 @@ async function getTabsWithAudio(excludeTabId = null) {
         if (tabId !== excludeTabId && hasAudioActivity) {
             tabsWithAudio.push(Protocol.normalizeAudioTab({
                 tabId: tabId,
-                title: state.title || 'Unknown Tab',
+                title: state.title || '',
                 favIconUrl: state.favIconUrl || '',
                 url: state.url || '',
                 volume: state.volume ?? CONSTANTS.DEFAULT_VOLUME,
@@ -570,11 +896,14 @@ async function getTabsWithAudio(excludeTabId = null) {
             if (!tab?.id || tab.id === excludeTabId) continue;
             if (!tab.audible) continue;
             if (included.has(tab.id)) continue;
+            // The query snapshot can predate a close.
+            if (isTabClosed(tab.id)) continue;
 
             const state = tabState.get(tab.id) || {};
+            const audibleSeenAt = Date.now();
             tabsWithAudio.push(Protocol.normalizeAudioTab({
                 tabId: tab.id,
-                title: tab.title || state.title || 'Unknown Tab',
+                title: tab.title || state.title || '',
                 favIconUrl: tab.favIconUrl || state.favIconUrl || '',
                 url: tab.url || state.url || '',
                 volume: state.volume ?? CONSTANTS.DEFAULT_VOLUME,
@@ -588,7 +917,7 @@ async function getTabsWithAudio(excludeTabId = null) {
                 compressionRatio: state.compressionRatio ?? CONSTANTS.DEFAULT_COMPRESSION_RATIO,
                 compressionKnee: state.compressionKnee ?? CONSTANTS.DEFAULT_COMPRESSION_KNEE,
                 corsAffectedCount: state.corsAffectedCount ?? 0,
-                lastMediaSeenAt: state.lastMediaSeenAt,
+                lastMediaSeenAt: audibleSeenAt,
                 windowId: tab.windowId,
                 status: state.status || 'active'
             }));
@@ -598,13 +927,14 @@ async function getTabsWithAudio(excludeTabId = null) {
             // Ensure state exists for this tab so subsequent refreshes are stable
             tabState.set(tab.id, {
                 ...state,
-                title: tab.title || state.title || 'Unknown Tab',
+                title: tab.title || state.title || '',
                 favIconUrl: tab.favIconUrl || state.favIconUrl || '',
                 url: tab.url || state.url || '',
                 windowId: tab.windowId,
                 hasMedia: true,
                 status: state.status || 'active',
-                lastSeenAt: Date.now()
+                lastMediaSeenAt: audibleSeenAt,
+                lastSeenAt: audibleSeenAt
             });
         }
     } catch (e) {
@@ -644,50 +974,73 @@ async function runInBatches(items, batchSize, asyncFn) {
 }
 
 async function hydrateTabStateFromOpenTabs() {
+    await ensureTabStateRestoredOrLog();
     const tabs = await browser.tabs.query({});
     const now = Date.now();
 
     // First pass: at least capture basic tab metadata + audible hint
     for (const tab of tabs) {
-        if (!tab?.id) continue;
+        if (!tab?.id || isTabClosed(tab.id)) continue;
         const prev = tabState.get(tab.id) || {};
+        // A silent snapshot says nothing new about a tab whose frames already reported: keep what
+        // they said. Otherwise fold the audible flag in without a sticky OR.
+        const keepReportedMedia = tab.audible !== true && frameStatusCache.has(tab.id);
+        const hint = keepReportedMedia
+            ? { hasMedia: prev.hasMedia === true, status: prev.status || 'no-media', fresh: false }
+            : resolveAudibleHint(tab.id, prev, tab.audible === true);
 
         tabState.set(tab.id, {
             ...prev,
-            title: tab.title || prev.title || 'Unknown Tab',
+            title: tab.title || prev.title || '',
             favIconUrl: tab.favIconUrl || prev.favIconUrl || '',
             url: tab.url || prev.url || '',
             windowId: tab.windowId,
             extensionEnabled: prev.extensionEnabled ?? true,
-            hasMedia: prev.hasMedia === true || tab.audible === true,
-            status: tab.audible ? 'active' : (prev.status || 'no-media'),
+            hasMedia: hint.hasMedia,
+            status: hint.status,
+            lastMediaSeenAt: hint.fresh ? getNextLastMediaSeenAt(prev, hint.hasMedia) : prev.lastMediaSeenAt,
             lastSeenAt: prev.lastSeenAt || now
         });
     }
 
-    // Second pass: rebuild via executeScript (covers iframe players).
-    // Only do this when needed, because it's heavier.
-    const hasAnyMedia = Array.from(tabState.values()).some(s => s?.hasMedia);
-    if (hasAnyMedia) return;
+    // Second pass: rebuild via executeScript (covers iframe players). A tab is skipped only when
+    // its record reports media and cached frame statuses back that (a live STATUS_UPDATE or an
+    // earlier probe), which is fresher than a probe. Every other http tab is probed, whether or
+    // not some other tab has media.
 
     // Use bounded concurrency to avoid spikes when many tabs are open.
     const HYDRATE_BATCH_SIZE = 10;
     await runInBatches(tabs, HYDRATE_BATCH_SIZE, async (tab) => {
-        if (!tab?.id) return;
+        if (!tab?.id || isTabClosed(tab.id)) return;
         if (!tab.url || !/^(https?|file):/i.test(tab.url)) return;
+        const hadFrameStatuses = frameStatusCache.has(tab.id);
+        if (hadFrameStatuses && tabState.get(tab.id)?.hasMedia === true) return;
 
         try {
             const framePayloads = await getFrameStatusPayloads(tab.id);
             if (framePayloads.length === 0) return;
-            const merged = mergeFrameStatusPayloads(framePayloads);
+            // The tab can close, or a live STATUS_UPDATE can arrive, while the frames are queried;
+            // either way this older result must not be written.
+            if (isTabClosed(tab.id) || (!hadFrameStatuses && frameStatusCache.has(tab.id))) return;
+            // ISS-006: remember every frame, so a later single-frame STATUS_UPDATE merges with its
+            // siblings and a pass that follows skips this tab. The cache is never persisted.
+            replaceCachedFrameStatusPayloads(tab.id, framePayloads);
+            const merged = mergeFrameStatusPayloads(framePayloads, tab.id);
 
             const prev = tabState.get(tab.id) || {};
             const hasMedia = mergedStatusHasMedia(merged);
+            const prevControl = getTabVolumeControl(prev);
+            const keepManagedVolume = Protocol.isManagedVolumeControl(prevControl);
+            const commandInFlight = isCommandDeliveryInFlight(tab.id);
 
             tabState.set(tab.id, {
                 ...prev,
-                volume: merged.volume ?? prev.volume ?? 100,
-                extensionEnabled: merged.extensionEnabled ?? prev.extensionEnabled ?? true,
+                volume: keepManagedVolume
+                    ? (prev.volume ?? CONSTANTS.DEFAULT_VOLUME)
+                    : (merged.volume ?? prev.volume ?? 100),
+                extensionEnabled: commandInFlight
+                    ? (prev.extensionEnabled ?? true)
+                    : (merged.extensionEnabled ?? prev.extensionEnabled ?? true),
                 monoEnabled: merged.monoEnabled ?? prev.monoEnabled,
                 balance: merged.balance ?? prev.balance,
                 corsAffectedCount: merged.corsAffectedCount ?? prev.corsAffectedCount ?? 0,
@@ -696,10 +1049,13 @@ async function hydrateTabStateFromOpenTabs() {
                 compressionRatio: merged.compressionRatio ?? prev.compressionRatio,
                 compressionKnee: merged.compressionKnee ?? prev.compressionKnee,
                 audioSettingsAvailable: merged.audioSettingsAvailable ?? prev.audioSettingsAvailable ?? true,
-                audioSettingsReason: merged.audioSettingsReason ?? prev.audioSettingsReason ?? null,
+                audioSettingsReason: (merged.audioSettingsAvailable ?? prev.audioSettingsAvailable ?? true)
+                    ? null
+                    : Protocol.coalesceExplicit(merged.audioSettingsReason, prev.audioSettingsReason, null),
                 hasMedia,
                 status: merged.status,
-                lastMediaSeenAt: getNextLastMediaSeenAt(prev, hasMedia, merged.status),
+                statusDetail: Protocol.coalesceExplicit(merged.statusDetail, prev.statusDetail, null),
+                lastMediaSeenAt: getNextLastMediaSeenAt(prev, hasMedia),
                 lastSeenAt: Date.now()
             });
         } catch {
@@ -709,44 +1065,63 @@ async function hydrateTabStateFromOpenTabs() {
 }
 
 async function hydrateMutedMediaCandidatesFromOpenTabs(limit = 15) {
+    await ensureTabStateRestoredOrLog();
     // When popup forces hydrate, also probe a small set of non-audible tabs to catch muted-but-playing media.
     const tabs = await browser.tabs.query({ currentWindow: true });
     let probed = 0;
 
     for (const tab of tabs) {
         if (probed >= limit) break;
-        if (!tab?.id) continue;
+        if (!tab?.id || isTabClosed(tab.id)) continue;
         if (!tab.url || !/^(https?|file):/i.test(tab.url)) continue;
         if (tab.audible) continue; // already covered
 
-        const prev = tabState.get(tab.id) || {};
-        if (prev.hasMedia === true) continue;
-        if (prev.lastMediaSeenAt && (Date.now() - prev.lastMediaSeenAt) < CONSTANTS.RECENT_MEDIA_TTL_MS) continue;
+        const recordBeforeProbe = tabState.get(tab.id);
+        const prevBeforeProbe = recordBeforeProbe || {};
+        if (prevBeforeProbe.hasMedia === true) continue;
+        if (prevBeforeProbe.lastMediaSeenAt && (Date.now() - prevBeforeProbe.lastMediaSeenAt) < CONSTANTS.RECENT_MEDIA_TTL_MS) continue;
 
         try {
             const framePayloads = await getFrameStatusPayloads(tab.id);
             if (framePayloads.length === 0) continue;
+            if (isTabClosed(tab.id)) continue;
+            // Every status writer replaces the record object, so a different object means a write
+            // landed during the await. That write is newer than this probe and wins.
+            if (tabState.get(tab.id) !== recordBeforeProbe) continue;
 
-            const merged = mergeFrameStatusPayloads(framePayloads);
+            // ISS-006: see hydrateTabStateFromOpenTabs. A live write would have replaced the record.
+            replaceCachedFrameStatusPayloads(tab.id, framePayloads);
+            const merged = mergeFrameStatusPayloads(framePayloads, tab.id);
             const hasMedia = mergedStatusHasMedia(merged);
 
             if (!hasMedia) continue;
 
+            // Re-read immediately before the write: in-place edits (setters) since the probe started
+            // are kept, including `extensionEnabled` and the compression fields.
+            const prev = tabState.get(tab.id) || {};
+            const prevControl = getTabVolumeControl(prev);
+            const keepManagedVolume = Protocol.isManagedVolumeControl(prevControl);
+
             tabState.set(tab.id, {
                 ...prev,
-                title: tab.title || prev.title || 'Unknown Tab',
+                title: tab.title || prev.title || '',
                 favIconUrl: tab.favIconUrl || prev.favIconUrl || '',
                 url: tab.url || prev.url || '',
                 windowId: tab.windowId,
-                volume: normalizeVolume(merged.volume ?? prev.volume ?? CONSTANTS.DEFAULT_VOLUME, CONSTANTS.DEFAULT_VOLUME),
+                volume: keepManagedVolume
+                    ? (prev.volume ?? CONSTANTS.DEFAULT_VOLUME)
+                    : normalizeVolume(merged.volume ?? prev.volume ?? CONSTANTS.DEFAULT_VOLUME, CONSTANTS.DEFAULT_VOLUME),
                 monoEnabled: merged.monoEnabled ?? prev.monoEnabled,
                 balance: merged.balance ?? prev.balance,
                 corsAffectedCount: normalizeCorsCount(merged.corsAffectedCount ?? prev.corsAffectedCount ?? 0),
                 audioSettingsAvailable: merged.audioSettingsAvailable ?? prev.audioSettingsAvailable ?? true,
-                audioSettingsReason: merged.audioSettingsReason ?? prev.audioSettingsReason ?? null,
+                audioSettingsReason: (merged.audioSettingsAvailable ?? prev.audioSettingsAvailable ?? true)
+                    ? null
+                    : Protocol.coalesceExplicit(merged.audioSettingsReason, prev.audioSettingsReason, null),
                 hasMedia: true,
                 status: merged.status,
-                lastMediaSeenAt: getNextLastMediaSeenAt(prev, true, merged.status),
+                statusDetail: Protocol.coalesceExplicit(merged.statusDetail, prev.statusDetail, null),
+                lastMediaSeenAt: getNextLastMediaSeenAt(prev, true),
                 lastSeenAt: Date.now()
             });
 
@@ -777,58 +1152,165 @@ function broadcastAudioStateChanged(tabId) {
     audioStateBroadcastTimers.set(tabId, t);
 }
 
+// Resolves true when a content script received the command, false when the fallback found no
+// content script API in any frame. Rejects when the tab cannot be reached at all. Mute and enable
+// callers tolerate a missing API and ignore the result; `setVolumeForTab` reverts on it (ISS-007).
+async function deliverToTab(tabId, message, fallbackFnName, fallbackArgs) {
+    try {
+        await browser.tabs.sendMessage(tabId, message);
+        return true;
+    } catch {
+        const results = await browser.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            func: (name, args) => {
+                const api = window.__volumeControlExtension__;
+                if (api && typeof api[name] === 'function') {
+                    api[name](...args);
+                    return true;
+                }
+                return false;
+            },
+            args: [fallbackFnName, fallbackArgs]
+        });
+        return Array.isArray(results) && results.some((result) => result?.result === true);
+    }
+}
+
+// Delivers a mute or enable command and holds the in-flight guard for exactly that long.
+async function deliverCommandToTab(tabId, message, fallbackFnName, fallbackArgs) {
+    beginCommandDelivery(tabId);
+    try {
+        await deliverToTab(tabId, message, fallbackFnName, fallbackArgs);
+    } finally {
+        endCommandDelivery(tabId);
+    }
+}
+
+// ISS-007: record fields a volume commit writes (`commitTabVolumeControl`), captured before the
+// commit so a failed delivery can put them back.
+const VOLUME_COMMIT_FIELDS = ['volume', 'volumeControl', 'volumeBeforeMute', 'lastSeenAt'];
+
+function snapshotVolumeCommitFields(state) {
+    const snapshot = {};
+    for (const field of VOLUME_COMMIT_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(state, field)) {
+            snapshot[field] = state[field];
+        }
+    }
+    return snapshot;
+}
+
+// Undoes a volume commit whose command never reached the page, so the record never claims a managed
+// target the page did not receive. A newer control that landed meanwhile wins: the revert applies
+// only while the record still holds exactly the control this call committed.
+async function revertUndeliveredVolumeCommit(tabId, committedControl, priorFields) {
+    const state = tabState.get(tabId);
+    if (!state || !Protocol.volumeControlsEqual(getTabVolumeControl(state), committedControl)) {
+        return false;
+    }
+    for (const field of VOLUME_COMMIT_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(priorFields, field)) {
+            state[field] = priorFields[field];
+        } else {
+            delete state[field];
+        }
+    }
+    markTabStateDirty(tabId);
+    debouncedUpdateIcon(tabId, state.volume ?? CONSTANTS.DEFAULT_VOLUME, state.corsAffectedCount ?? 0);
+    try {
+        await flushPersistedTabState();
+    } catch (error) {
+        // The dirty mark stays, so the next flush retries the write.
+        console.warn(`Failed to persist the reverted volume for tab ${tabId}:`, error);
+    }
+    return true;
+}
+
+// ISS-007: volume sends to one tab run one after the other. Each send then snapshots exactly the
+// record the previous send left, so a failed delivery always reverts to a state the page received
+// and two overlapping failures cannot strand an undelivered control.
+const volumeSendChains = new Map();
+
 /**
  * Send volume command to a specific tab
  * @param {number} tabId - Target tab ID
  * @param {number} volume - Volume percentage (0-500)
  */
-async function setVolumeForTab(tabId, volume) {
-    try {
-        const safeVolume = normalizeVolume(volume, CONSTANTS.DEFAULT_VOLUME);
-
-        // Update local state first
-        const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
-        state.volume = safeVolume;
-        if (state.muted) {
-            state.volumeBeforeMute = safeVolume;
+function setVolumeForTab(tabId, volume, options = {}) {
+    const previous = volumeSendChains.get(tabId) || Promise.resolve();
+    const run = previous.then(() => setVolumeForTabNow(tabId, volume, options));
+    const tail = run.catch(() => {});
+    volumeSendChains.set(tabId, tail);
+    tail.then(() => {
+        if (volumeSendChains.get(tabId) === tail) {
+            volumeSendChains.delete(tabId);
         }
-        tabState.set(tabId, state);
+    });
+    return run;
+}
 
-        schedulePersistTabState(tabId);
-        
-        // Update icon
-        debouncedUpdateIcon(tabId, safeVolume, state.corsAffectedCount);
+async function setVolumeForTabNow(tabId, volume, options = {}) {
+    try {
+        await ensureTabStateRestoredOrLog();
+        if (isTabClosed(tabId)) {
+            return { success: false, error: 'Tab closed' };
+        }
+        const safeVolume = normalizeVolume(volume, CONSTANTS.DEFAULT_VOLUME);
+        const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
+        const currentControl = getTabVolumeControl(state);
+        const nextRevision = Math.max(1, Math.floor(Number(currentControl.revision) || 0) + 1);
+        const source = options.source || Protocol.VolumeControlSource.EXTENSION;
+        const control = Protocol.createManagedVolumeControl(safeVolume, source, nextRevision);
+        // Same synchronous step as the commit's mutation, so the snapshot is exactly the prior record.
+        const priorFields = snapshotVolumeCommitFields(state);
+        let commitResult;
+        try {
+            commitResult = await commitTabVolumeControl(tabId, control, { immediate: true });
+        } catch (error) {
+            // The record changed before the write failed; the command is not delivered, so undo it.
+            await revertUndeliveredVolumeCommit(tabId, control, priorFields);
+            throw error;
+        }
+        if (commitResult?.accepted === false) {
+            return { success: false, control: commitResult.control };
+        }
+        const nextState = tabState.get(tabId) || state;
 
-        // Send volume to content scripts.
-        // Prefer runtime messaging (reliably reaches the extension content-script context).
-        // Keep executeScript as a fallback for environments where messaging fails.
+        debouncedUpdateIcon(tabId, nextState.volume, nextState.corsAffectedCount);
+
         const payload = {
             requestedVolume: safeVolume,
-            source: 'background:remote-tab-control',
+            source: options.messageSource || 'background:remote-tab-control',
             issuedAt: Date.now()
         };
 
+        let delivered = false;
+        let deliveryError = null;
         try {
-            await browser.tabs.sendMessage(tabId, {
+            delivered = await deliverToTab(tabId, {
                 type: Messages.SET_VOLUME,
                 payload
-            });
-        } catch {
-            // Fallback: attempt a direct injection call (may be required on some pages).
-            await browser.scripting.executeScript({
-                target: { tabId: tabId, allFrames: true },
-                func: (injectedPayload) => {
-                    if (window.__volumeControlExtension__ && typeof window.__volumeControlExtension__.setVolume === 'function') {
-                        window.__volumeControlExtension__.setVolume(injectedPayload);
-                    }
-                },
-                args: [payload]
-            });
+            }, 'setVolume', [payload]);
+        } catch (error) {
+            deliveryError = error;
+        }
+
+        if (!delivered) {
+            await revertUndeliveredVolumeCommit(tabId, commitResult.control, priorFields);
+            broadcastAudioStateChanged(tabId);
+            if (deliveryError) {
+                throw deliveryError;
+            }
+            return {
+                success: false,
+                error: 'Page controls unreachable',
+                control: getTabVolumeControl(tabState.get(tabId))
+            };
         }
 
         broadcastAudioStateChanged(tabId);
-        
-        return { success: true };
+
+        return { success: true, control: commitResult.control };
     } catch (error) {
         console.error(`Failed to set volume for tab ${tabId}:`, error);
         return { success: false, error: error.message };
@@ -842,6 +1324,10 @@ async function setVolumeForTab(tabId, volume) {
  */
 async function setCompressionForTab(tabId, settings) {
     try {
+        await ensureTabStateRestoredOrLog();
+        if (isTabClosed(tabId)) {
+            return { success: false, error: 'Tab closed' };
+        }
         const normalizedSettings = Protocol.normalizeCompressionSettings(settings);
 
         // Update local state first
@@ -856,22 +1342,10 @@ async function setCompressionForTab(tabId, settings) {
 
         // Send compression settings to content scripts.
         // Prefer runtime messaging; keep executeScript as a fallback.
-        try {
-            await browser.tabs.sendMessage(tabId, {
-                type: Messages.SET_COMPRESSION,
-                payload: normalizedSettings
-            });
-        } catch {
-            await browser.scripting.executeScript({
-                target: { tabId: tabId, allFrames: true },
-                func: (compressionSettings) => {
-                    if (window.__volumeControlExtension__ && typeof window.__volumeControlExtension__.setCompressionSettings === 'function') {
-                        window.__volumeControlExtension__.setCompressionSettings(compressionSettings);
-                    }
-                },
-                args: [normalizedSettings]
-            });
-        }
+        await deliverToTab(tabId, {
+            type: Messages.SET_COMPRESSION,
+            payload: normalizedSettings
+        }, 'setCompressionSettings', [normalizedSettings]);
 
         broadcastAudioStateChanged(tabId);
         
@@ -886,22 +1360,10 @@ async function setGlobalBalanceForTab(tabId, settings) {
     try {
         const normalizedSettings = Protocol.normalizeGlobalBalanceSettings(settings);
 
-        try {
-            await browser.tabs.sendMessage(tabId, {
-                type: Messages.SET_GLOBAL_BALANCE,
-                payload: normalizedSettings
-            });
-        } catch {
-            await browser.scripting.executeScript({
-                target: { tabId, allFrames: true },
-                func: (globalBalanceSettings) => {
-                    if (window.__volumeControlExtension__ && typeof window.__volumeControlExtension__.setGlobalBalance === 'function') {
-                        window.__volumeControlExtension__.setGlobalBalance(globalBalanceSettings);
-                    }
-                },
-                args: [normalizedSettings]
-            });
-        }
+        await deliverToTab(tabId, {
+            type: Messages.SET_GLOBAL_BALANCE,
+            payload: normalizedSettings
+        }, 'setGlobalBalance', [normalizedSettings]);
 
         broadcastAudioStateChanged(tabId);
         return { success: true };
@@ -924,6 +1386,10 @@ async function setMuteForTab(tabId, muted) {
 
 async function setMuteForTabWithOptions(tabId, muted, options = {}) {
     try {
+        await ensureTabStateRestoredOrLog();
+        if (isTabClosed(tabId)) {
+            return { success: false, error: 'Tab closed' };
+        }
         const nextMuted = Boolean(muted);
         const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
         const explicitVolumeBeforeMute = Number.isFinite(Number(options.volumeBeforeMute))
@@ -940,22 +1406,10 @@ async function setMuteForTabWithOptions(tabId, muted, options = {}) {
         schedulePersistTabState(tabId);
         debouncedUpdateIcon(tabId, state.volume ?? CONSTANTS.DEFAULT_VOLUME, state.corsAffectedCount ?? 0);
 
-        try {
-            await browser.tabs.sendMessage(tabId, {
-                type: Messages.SET_MUTE_STATE,
-                payload: { muted: nextMuted }
-            });
-        } catch {
-            await browser.scripting.executeScript({
-                target: { tabId, allFrames: true },
-                func: (payload) => {
-                    if (window.__volumeControlExtension__ && typeof window.__volumeControlExtension__.setMuteState === 'function') {
-                        window.__volumeControlExtension__.setMuteState(payload.muted);
-                    }
-                },
-                args: [{ muted: nextMuted }]
-            });
-        }
+        await deliverCommandToTab(tabId, {
+            type: Messages.SET_MUTE_STATE,
+            payload: { muted: nextMuted }
+        }, 'setMuteState', [nextMuted]);
 
         broadcastAudioStateChanged(tabId);
         return { success: true };
@@ -967,6 +1421,11 @@ async function setMuteForTabWithOptions(tabId, muted, options = {}) {
 
 async function setExtensionEnabledForTab(tabId, enabled) {
     try {
+        await ensureTabStateRestoredOrLog();
+        if (isTabClosed(tabId)) {
+            // Same outcome as a delivery to a tab that is already gone (see the catch below).
+            return { success: true };
+        }
         const nextEnabled = enabled !== false;
         const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
         state.extensionEnabled = nextEnabled;
@@ -974,22 +1433,10 @@ async function setExtensionEnabledForTab(tabId, enabled) {
         schedulePersistTabState(tabId);
         debouncedUpdateIcon(tabId, state.volume ?? CONSTANTS.DEFAULT_VOLUME, state.corsAffectedCount ?? 0);
 
-        try {
-            await browser.tabs.sendMessage(tabId, {
-                type: Messages.SET_EXTENSION_ENABLED,
-                payload: { enabled: nextEnabled }
-            });
-        } catch {
-            await browser.scripting.executeScript({
-                target: { tabId, allFrames: true },
-                func: (payload) => {
-                    if (window.__volumeControlExtension__ && typeof window.__volumeControlExtension__.setExtensionEnabled === 'function') {
-                        window.__volumeControlExtension__.setExtensionEnabled(payload.enabled);
-                    }
-                },
-                args: [{ enabled: nextEnabled }]
-            });
-        }
+        await deliverCommandToTab(tabId, {
+            type: Messages.SET_EXTENSION_ENABLED,
+            payload: { enabled: nextEnabled }
+        }, 'setExtensionEnabled', [nextEnabled]);
 
         broadcastAudioStateChanged(tabId);
         return { success: true };
@@ -1115,7 +1562,7 @@ async function runDiagnosticsCommandOnTab(tabId, commandName, args = []) {
     const frameResults = (results || []).map((result, index) => ({
         frameId: typeof result?.frameId === 'number' ? result.frameId : index,
         tabId: targetTab.id,
-        tabTitle: targetTab.title || 'Unknown Tab',
+        tabTitle: targetTab.title || '',
         tabUrl: targetTab.url || '',
         ...(result?.result || {
             ok: false,
@@ -1128,7 +1575,7 @@ async function runDiagnosticsCommandOnTab(tabId, commandName, args = []) {
 
     return {
         tabId: targetTab.id,
-        tabTitle: targetTab.title || 'Unknown Tab',
+        tabTitle: targetTab.title || '',
         tabUrl: targetTab.url || '',
         commandName,
         frames: frameResults
@@ -1225,7 +1672,8 @@ async function handleVolumeCommand(command) {
     }
 
     const state = await getFreshCommandState(activeTab.id) || {};
-    const currentVolume = normalizeVolume(state.volume, CONSTANTS.DEFAULT_VOLUME);
+    // Step from the managed target; telemetry only decides when the tab has no managed control.
+    const currentVolume = resolveTabAuthoritativeVolume(state, state.volume);
     let nextVolume = currentVolume;
 
     if (command === 'volume-up') {
@@ -1267,11 +1715,14 @@ async function handleToggleMuteCommand() {
     await probeTabStatus(activeTab.id).catch(() => false);
     const state = await getFreshCommandState(activeTab.id) || {};
     await setMuteForTabWithOptions(activeTab.id, !Boolean(state.muted), {
-        volumeBeforeMute: getDisplayedVolumeForState(state, CONSTANTS.DEFAULT_VOLUME)
+        volumeBeforeMute: resolveTabAuthoritativeVolume(state, state.volume)
     });
 }
 
 async function handleCommand(command) {
+    // The single barrier for every shortcut: they read `tabState`, which is empty after a wake.
+    await ensureTabStateRestoredOrLog();
+
     if (command === 'volume-up' || command === 'volume-down' || command === 'volume-reset') {
         await handleVolumeCommand(command);
         return;
@@ -1287,132 +1738,272 @@ async function handleCommand(command) {
     }
 }
 
+async function handleStatusUpdateMessage(message, sender) {
+    const tabId = sender.tab.id;
+    await ensureTabStateRestored();
+    // A message that was waiting for the restore may belong to a tab that has since closed.
+    if (isTabClosed(tabId)) return;
+    const frameId = typeof sender.frameId === 'number' ? sender.frameId : 0;
+    // ISS-006: without cached frames the merge below sees only this frame. The cache is empty on a
+    // new tab and after an event-page wake, which this code cannot tell apart, so a partial merge is
+    // assumed only when a frame other than the top frame reports or the record already saw media.
+    const hadCachedFrames = frameStatusCache.has(tabId);
+    let payload = mergeCachedFrameStatusPayload(tabId, frameId, message.payload);
+
+    // A recovered main frame clears a stale limited overlay: when frame 0 reports healthy media
+    // while the merge still claims a limitation it does not report, the contradicting entries
+    // come from siblings that went silent (a missed removal, or a probe that found no frames).
+    // Siblings that reported within a hydrate interval are live multi-frame media and are kept;
+    // a probe reconciles whatever the eviction leaves behind.
+    if (frameId === 0 && isHealthyMainFramePayload(message.payload)) {
+        const contradicts = (payload.statusDetail === 'limited' && message.payload?.statusDetail !== 'limited') ||
+            (normalizeCorsCount(payload.corsAffectedCount) > 0 &&
+                normalizeCorsCount(message.payload?.corsAffectedCount) === 0);
+        if (contradicts && evictStaleCachedFramePayloads(tabId, frameId)) {
+            payload = mergeFrameStatusPayloads(Array.from(frameStatusCache.get(tabId).values()), tabId);
+            scheduleProbeTabStatus(tabId, 80);
+        }
+    }
+
+    const currentState = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
+    const partialColdMerge = !hadCachedFrames && (frameId !== 0 || recordHadMedia(currentState));
+    const reportedHasMedia = mergedStatusHasMedia(payload);
+    // A frame that reports no media must not erase what the record knew about other frames; the
+    // probe scheduled below replaces these preserved values with the full merge.
+    const preserveMedia = partialColdMerge && !reportedHasMedia && recordHadMedia(currentState);
+    const corsCount = preserveMedia
+        ? Math.max(normalizeCorsCount(payload.corsAffectedCount), normalizeCorsCount(currentState.corsAffectedCount))
+        : normalizeCorsCount(payload.corsAffectedCount);
+    const keepPriorStatus = preserveMedia && payload.status === 'no-media' &&
+        (currentState.status === 'active' || currentState.status === 'inactive');
+    const status = keepPriorStatus ? currentState.status : payload.status;
+
+    const prevAudioActivity = computeHasAudioActivity(currentState);
+    const volumeControl = getTabVolumeControl(currentState);
+    const volume = resolveTabAuthoritativeVolume(
+        currentState,
+        preserveMedia ? currentState.volume : (payload.observedVolume ?? payload.volume)
+    );
+
+    // While a background mute or enable command is being delivered the record already holds the
+    // commanded value, so this telemetry (captured before the page applied it) must not revert it.
+    // Once the delivery is done the page's report applies again, which is how a player-UI unmute
+    // reaches the record.
+    const commandInFlight = isCommandDeliveryInFlight(tabId);
+
+    // If user changes volume elsewhere after using mute toggle, clear muted state
+    const nextMuted = commandInFlight
+        ? Boolean(currentState.muted)
+        : Boolean(payload.muted ?? currentState.muted ?? false);
+    const nextExtensionEnabled = commandInFlight && typeof currentState.extensionEnabled === 'boolean'
+        ? currentState.extensionEnabled
+        : payload.extensionEnabled !== false;
+    const nextVolumeBeforeMute = commandInFlight
+        ? currentState.volumeBeforeMute
+        : (nextMuted
+            ? (currentState.muted
+                ? (currentState.volumeBeforeMute ?? currentState.volume ?? volume)
+                : (currentState.volume ?? volume))
+            : undefined);
+
+    // Determine if tab has media (for showing in Other Tabs list)
+    const hasMedia = reportedHasMedia || (preserveMedia && currentState.hasMedia === true);
+
+    // Update tracked state including tab info and compression state
+    tabState.set(tabId, {
+        ...currentState,
+        volume,
+        // Keep a real managed control; otherwise mirror telemetry as unmanaged revision 0.
+        volumeControl: Protocol.isManagedVolumeControl(volumeControl)
+            ? volumeControl
+            : Protocol.createUnmanagedVolumeControl(volume),
+        extensionEnabled: nextExtensionEnabled,
+        monoEnabled: payload.monoEnabled ?? currentState.monoEnabled ?? CONSTANTS.DEFAULT_MONO_ENABLED,
+        balance: payload.balance ?? currentState.balance ?? CONSTANTS.DEFAULT_BALANCE,
+        corsAffectedCount: corsCount,
+        status: status,
+        // Explicit null must clear transitional details like "setting-up".
+        statusDetail: Protocol.coalesceExplicit(payload.statusDetail, currentState.statusDetail, null),
+        hasMedia: hasMedia,
+        muted: nextMuted,
+        volumeBeforeMute: nextVolumeBeforeMute,
+        lastSeenAt: Date.now(),
+        // Only what this frame reported is fresh evidence; a preserved flag is not.
+        lastMediaSeenAt: getNextLastMediaSeenAt(currentState, reportedHasMedia),
+        compressionEnabled: payload.compressionEnabled ?? currentState.compressionEnabled ?? false,
+        compressionThreshold: payload.compressionThreshold ?? currentState.compressionThreshold ?? -18,
+        compressionRatio: payload.compressionRatio ?? currentState.compressionRatio ?? 6,
+        compressionKnee: payload.compressionKnee ?? currentState.compressionKnee ?? 3,
+        audioSettingsAvailable: payload.audioSettingsAvailable ?? currentState.audioSettingsAvailable ?? true,
+        audioSettingsReason: (payload.audioSettingsAvailable ?? currentState.audioSettingsAvailable ?? true)
+            ? null
+            : Protocol.coalesceExplicit(payload.audioSettingsReason, currentState.audioSettingsReason, null),
+        title: sender.tab.title || currentState.title || '',
+        favIconUrl: sender.tab.favIconUrl || currentState.favIconUrl || '',
+        url: sender.tab.url || currentState.url || '',
+        windowId: sender.tab.windowId
+    });
+
+    schedulePersistTabState(tabId);
+
+    const nextAudioActivity = computeHasAudioActivity(tabState.get(tabId));
+    if (prevAudioActivity !== nextAudioActivity) {
+        broadcastAudioStateChanged(tabId);
+    }
+
+    const nextState = tabState.get(tabId);
+    const previousDisplayVolume = getDisplayedVolumeForState(currentState);
+    const nextDisplayVolume = getDisplayedVolumeForState(nextState);
+    const shouldUpdateIcon = !currentState.lastSeenAt ||
+        currentState.volume !== volume ||
+        previousDisplayVolume !== nextDisplayVolume ||
+        currentState.volumeControl?.revision !== nextState.volumeControl?.revision ||
+        currentState.volumeControl?.targetVolume !== nextState.volumeControl?.targetVolume ||
+        currentState.corsAffectedCount !== corsCount ||
+        Boolean(currentState.muted) !== nextMuted ||
+        currentState.extensionEnabled !== nextExtensionEnabled ||
+        currentState.status !== status ||
+        currentState.statusDetail !== nextState.statusDetail ||
+        currentState.hasMedia !== hasMedia;
+
+    // Also paint on the first managed status transition, even when volume is still 100%.
+    if (shouldUpdateIcon) {
+        debouncedUpdateIcon(tabId, volume, corsCount);
+    }
+
+    if (partialColdMerge) {
+        scheduleProbeTabStatus(tabId, 80);
+    }
+}
+
+/**
+ * Run an async message handler and always answer, so a thrown error never leaves
+ * the sender waiting on a channel that was kept open with `return true`.
+ */
+function respondAsync(sendResponse, label, task) {
+    Promise.resolve()
+        .then(task)
+        .then(sendResponse, (error) => {
+            console.error(`${label} failed:`, error);
+            sendResponse({ success: false, error: error?.message || String(error) });
+        });
+    return true;
+}
+
 /**
  * Handle messages from content scripts and popup
  */
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === Messages.INSTALL_PAGE_MEDIA_BRIDGE) {
+    if (message.type === Messages.REPORT_PLAYER_VOLUME_INTENT) {
+        const tabId = sender.tab?.id;
+        if (!tabId) {
+            sendResponse({ relayed: false });
+            return;
+        }
+        const requestedPhase = message.payload?.phase;
+        const phase = ['start', 'move', 'end', 'cancel'].includes(requestedPhase)
+            ? requestedPhase
+            : 'pulse';
+
+        browser.tabs.sendMessage(tabId, {
+            type: Messages.PLAYER_VOLUME_INTENT,
+            payload: {
+                issuedAt: Date.now(),
+                originFrameId: typeof sender.frameId === 'number' ? sender.frameId : 0,
+                phase,
+                gestureId: message.payload?.gestureId == null
+                    ? null
+                    : String(message.payload.gestureId).slice(0, 128),
+                sequence: Math.max(0, Math.floor(Number(message.payload?.sequence) || 0))
+            }
+        }).then(
+            () => sendResponse({ relayed: true }),
+            () => sendResponse({ relayed: false })
+        );
+        return true;
+    }
+
+    if (message.type === Messages.GET_TAB_VOLUME_CONTROL) {
+        const tabId = sender.tab?.id;
+        if (!tabId) {
+            sendResponse({ control: Protocol.createUnmanagedVolumeControl() });
+            return;
+        }
         (async () => {
             try {
-                const tabId = sender.tab?.id;
-                const frameId = typeof sender.frameId === 'number' ? sender.frameId : 0;
-                const installed = await installPageMediaBridge(tabId, frameId);
-                sendResponse({ installed });
+                await ensureTabStateRestored();
+                const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
+                sendResponse({ control: getTabVolumeControl(state) });
             } catch (error) {
-                const unsupportedMainWorld = /Execution world|world\.MAIN|Invalid enumeration value/i.test(error?.message || '');
-                if (!unsupportedMainWorld) {
-                    console.warn('Failed to install MAIN-world media bridge:', error);
-                }
-                sendResponse({ installed: false, error: error?.message || String(error) });
+                sendResponse({ control: Protocol.createUnmanagedVolumeControl() });
             }
         })();
         return true;
     }
 
-    if (message.type === Messages.STATUS_UPDATE && sender.tab && sender.tab.id) {
+    if (message.type === Messages.COMMIT_TAB_VOLUME_CONTROL) {
+        const tabId = sender.tab?.id;
+        if (!tabId) {
+            sendResponse({ accepted: false });
+            return;
+        }
+        (async () => {
+            try {
+                await ensureTabStateRestored();
+                const result = await commitTabVolumeControl(tabId, message.payload?.control, { immediate: true });
+                if (result?.accepted && result.control && result.unchanged !== true) {
+                    void browser.tabs.sendMessage(tabId, {
+                        type: Messages.TAB_VOLUME_CONTROL_UPDATED,
+                        payload: {
+                            control: result.control,
+                            originFrameId: typeof sender.frameId === 'number' ? sender.frameId : 0
+                        }
+                    }).catch(() => {});
+                }
+                sendResponse(result);
+            } catch (error) {
+                sendResponse({ accepted: false, error: error?.message || String(error) });
+            }
+        })();
+        return true;
+    }
+
+    if (message.type === Messages.FRAME_STATUS_REMOVED && sender.tab?.id) {
         const tabId = sender.tab.id;
-        const payload = mergeCachedFrameStatusPayload(
-            tabId,
-            typeof sender.frameId === 'number' ? sender.frameId : 0,
-            message.payload
-        );
-        const volume = normalizeVolume(payload.volume, CONSTANTS.DEFAULT_VOLUME);
-        const corsCount = normalizeCorsCount(payload.corsAffectedCount);
-        const status = payload.status;
-        
-        // Get current state for this tab
-        const currentState = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
-        const prevAudioActivity = computeHasAudioActivity(currentState);
+        const frameId = typeof sender.frameId === 'number' ? sender.frameId : 0;
+        const hadCachedFrames = frameStatusCache.has(tabId);
+        if (removeCachedFrameStatusPayload(tabId, frameId)) {
+            scheduleProbeTabStatus(tabId, 50);
+        } else if (!hadCachedFrames) {
+            scheduleProbeForColdFrameRemoval(tabId).catch(() => {});
+        }
+        return;
+    }
 
-        // If user changes volume elsewhere after using mute toggle, clear muted state
-        const nextMuted = Boolean(payload.muted ?? currentState.muted ?? false);
-        const nextExtensionEnabled = payload.extensionEnabled !== false;
-        const nextVolumeBeforeMute = nextMuted
-            ? (currentState.muted
-                ? (currentState.volumeBeforeMute ?? currentState.volume ?? volume)
-                : (currentState.volume ?? volume))
-            : undefined;
-        
-        // Determine if tab has media (for showing in Other Tabs list)
-        const hasMedia = status === 'active' || status === 'inactive' || status === 'error' ||
-                        (payload.elementCounts && payload.elementCounts.total > 0);
-        
-        // Update tracked state including tab info and compression state
-        tabState.set(tabId, { 
-            ...currentState,
-            volume: volume, 
-            extensionEnabled: nextExtensionEnabled,
-            monoEnabled: payload.monoEnabled ?? currentState.monoEnabled ?? CONSTANTS.DEFAULT_MONO_ENABLED,
-            balance: payload.balance ?? currentState.balance ?? CONSTANTS.DEFAULT_BALANCE,
-            corsAffectedCount: corsCount,
-            status: status,
-            statusDetail: payload.statusDetail ?? currentState.statusDetail ?? null,
-            hasMedia: hasMedia,
-            muted: nextMuted,
-            volumeBeforeMute: nextVolumeBeforeMute,
-            lastSeenAt: Date.now(),
-            lastMediaSeenAt: getNextLastMediaSeenAt(currentState, hasMedia, status),
-            compressionEnabled: payload.compressionEnabled ?? currentState.compressionEnabled ?? false,
-            compressionThreshold: payload.compressionThreshold ?? currentState.compressionThreshold ?? -18,
-            compressionRatio: payload.compressionRatio ?? currentState.compressionRatio ?? 6,
-            compressionKnee: payload.compressionKnee ?? currentState.compressionKnee ?? 3,
-            audioSettingsAvailable: payload.audioSettingsAvailable ?? currentState.audioSettingsAvailable ?? true,
-            audioSettingsReason: payload.audioSettingsReason ?? currentState.audioSettingsReason ?? null,
-            title: sender.tab.title || currentState.title || 'Unknown Tab',
-            favIconUrl: sender.tab.favIconUrl || currentState.favIconUrl || '',
-            url: sender.tab.url || currentState.url || '',
-            windowId: sender.tab.windowId
+    if (message.type === Messages.STATUS_UPDATE && sender.tab && sender.tab.id) {
+        handleStatusUpdateMessage(message, sender).catch((error) => {
+            console.error('STATUS_UPDATE failed:', error);
         });
-
-        schedulePersistTabState(tabId);
-
-        const nextAudioActivity = computeHasAudioActivity(tabState.get(tabId));
-        if (prevAudioActivity !== nextAudioActivity) {
-            broadcastAudioStateChanged(tabId);
-        }
-
-        const shouldUpdateIcon = !currentState.lastSeenAt ||
-            currentState.volume !== volume ||
-            currentState.corsAffectedCount !== corsCount ||
-            Boolean(currentState.muted) !== nextMuted ||
-            currentState.extensionEnabled !== nextExtensionEnabled ||
-            currentState.status !== status ||
-            currentState.hasMedia !== hasMedia;
-        
-        // Also paint on the first managed status transition, even when volume is still 100%.
-        if (shouldUpdateIcon) {
-            debouncedUpdateIcon(tabId, volume, corsCount);
-        }
+        return;
     }
     
-    // Handle explicit volume update request from popup (for immediate updates)
+    // Retired (ISS-007): nothing sends VOLUME_UPDATE any more. A volume command must be delivered
+    // to the page by `setVolumeForTab`; committing a managed control here would claim a volume the
+    // page never received. The constant stays in the protocol for compatibility, and the message is
+    // ignored without a response, like STATUS_UPDATE.
     if (message.type === Messages.VOLUME_UPDATE) {
-        // Tab ID can come from sender.tab (content script) or payload.tabId (popup)
-        const tabId = sender.tab?.id ?? message.payload?.tabId;
-        if (!tabId) return;
-        
-        const volume = normalizeVolume(message.payload?.volume, CONSTANTS.DEFAULT_VOLUME);
-        const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
-        
-        state.volume = volume;
-        if (state.muted) {
-            state.volumeBeforeMute = volume;
-        }
-        state.lastSeenAt = Date.now();
-        tabState.set(tabId, state);
-
-        schedulePersistTabState(tabId);
-        
-        // Use debounced update for smooth slider experience
-        debouncedUpdateIcon(tabId, volume, state.corsAffectedCount);
+        return;
     }
-    
-    // Handle request for tabs with audio (from popup)
+
     if (message.type === Messages.GET_AUDIO_TABS) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
         const excludeTabId = message.payload?.excludeTabId ?? null;
         const forceHydrate = Boolean(message.payload?.forceHydrate);
         (async () => {
             try {
+                await ensureTabStateRestored();
                 if (forceHydrate || isStateStale()) {
                     await hydrateTabStateFromOpenTabs();
                     if (forceHydrate) {
@@ -1430,10 +2021,14 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === Messages.GET_TAB_STATUS) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
         const tabId = message.payload?.tabId;
         const forceProbe = Boolean(message.payload?.forceProbe);
         (async () => {
             try {
+                await ensureTabStateRestored();
                 const status = await getTabStatus(tabId, { forceProbe });
                 sendResponse({ status });
             } catch (e) {
@@ -1446,61 +2041,86 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     
     // Handle remote volume control request (from popup controlling other tabs)
     if (message.type === Messages.SET_REMOTE_TAB_VOLUME) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
         const targetTabId = message.payload?.tabId;
         const volume = message.payload?.volume ?? CONSTANTS.DEFAULT_VOLUME;
         
         if (targetTabId) {
-            setVolumeForTab(targetTabId, volume).then(result => {
-                sendResponse(result);
+            return respondAsync(sendResponse, 'SET_REMOTE_TAB_VOLUME', async () => {
+                await ensureTabStateRestored();
+                return setVolumeForTab(targetTabId, volume, {
+                    source: Protocol.VolumeControlSource.EXTENSION,
+                    messageSource: message.payload?.source || 'background:remote-tab-control'
+                });
             });
-            return true; // Keep channel open for async response
         }
     }
-    
-    // Handle remote compression control request (from popup controlling other tabs)
+
     if (message.type === Messages.SET_REMOTE_TAB_COMPRESSION) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
         const targetTabId = message.payload?.tabId;
         const settings = message.payload?.settings;
         
         if (targetTabId && settings) {
-            setCompressionForTab(targetTabId, settings).then((result) => {
-                sendResponse(result);
+            return respondAsync(sendResponse, 'SET_REMOTE_TAB_COMPRESSION', async () => {
+                await ensureTabStateRestored();
+                return setCompressionForTab(targetTabId, settings);
             });
-            return true;
         }
     }
 
     if (message.type === Messages.SET_GLOBAL_EXTENSION_ENABLED) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
         const enabled = message.payload?.enabled !== false;
-        setGlobalExtensionEnabled(enabled).then(sendResponse);
-        return true;
+        return respondAsync(sendResponse, 'SET_GLOBAL_EXTENSION_ENABLED', async () => {
+            await ensureTabStateRestored();
+            return setGlobalExtensionEnabled(enabled);
+        });
     }
 
     if (message.type === Messages.SET_GLOBAL_BALANCE) {
-        setGlobalBalance(message.payload).then(sendResponse);
-        return true;
+        if (isContentScriptSender(sender)) {
+            return;
+        }
+        return respondAsync(sendResponse, 'SET_GLOBAL_BALANCE', async () => {
+            await ensureTabStateRestored();
+            return setGlobalBalance(message.payload);
+        });
     }
-    
-    // Handle mute state update
+
     if (message.type === Messages.SET_TAB_MUTE_STATE) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
         const targetTabId = message.payload?.tabId;
         const muted = message.payload?.muted;
         const volumeBeforeMute = message.payload?.volumeBeforeMute;
         
-        if (targetTabId !== undefined) {
-            setMuteForTabWithOptions(targetTabId, muted, { volumeBeforeMute }).then(sendResponse);
+        if (targetTabId === undefined) {
+            sendResponse({ success: false, error: 'Missing tabId' });
+            return;
         }
-        return true;
+        return respondAsync(sendResponse, 'SET_TAB_MUTE_STATE', async () => {
+            await ensureTabStateRestored();
+            return setMuteForTabWithOptions(targetTabId, muted, { volumeBeforeMute });
+        });
     }
-    
-    // Handle request to focus/switch to a tab
+
     if (message.type === Messages.FOCUS_TAB) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
         const targetTabId = message.payload?.tabId;
         const windowId = message.payload?.windowId;
-        
+
         if (targetTabId) {
-            // First focus the window, then activate the tab
-            const focusTab = async () => {
+            (async () => {
                 try {
                     if (windowId) {
                         await browser.windows.update(windowId, { focused: true });
@@ -1510,9 +2130,8 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 } catch (error) {
                     sendResponse({ success: false, error: error.message });
                 }
-            };
-            focusTab();
-            return true; // Keep channel open for async response
+            })();
+            return true;
         }
     }
 });
@@ -1520,9 +2139,10 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 /**
  * Clean up when tabs are closed
  */
-browser.tabs.onRemoved.addListener((tabId) => {
-    tabState.delete(tabId);
-    removePersistedTabState(tabId);
+async function handleTabRemoved(tabId) {
+    // Record the close first and synchronously, so every async writer that resumes from now on
+    // skips this id; the restore below may still be in flight after a cold wake.
+    markTabClosed(tabId);
     clearCachedFrameStatusPayloads(tabId);
     if (badgeUpdateTimers.has(tabId)) {
         clearTimeout(badgeUpdateTimers.get(tabId));
@@ -1536,15 +2156,32 @@ browser.tabs.onRemoved.addListener((tabId) => {
         clearTimeout(probeTimers.get(tabId));
         probeTimers.delete(tabId);
     }
+
+    // The record is read and deleted only after the restore, so a restore that is still running
+    // cannot seed a closed tab back in (G3). The stored entry goes through the same persist chain.
+    await ensureTabStateRestoredOrLog();
+    tabState.delete(tabId);
+    await removePersistedTabState(tabId);
+}
+
+browser.tabs.onRemoved.addListener((tabId) => {
+    handleTabRemoved(tabId).catch((error) => {
+        console.warn('tabs.onRemoved handling failed:', error);
+    });
 });
 
 /**
  * Reset icon when tab URL changes (navigation) or update tab info
  */
 // Ignore update events that cannot affect icon or tab-state metadata.
-browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+async function handleTabUpdated(tabId, changeInfo, tab) {
     if (!changeInfo.status && !changeInfo.title && !changeInfo.favIconUrl && typeof changeInfo.audible !== 'boolean') return;
-    
+    if (isTabClosed(tabId)) return;
+
+    // Everything below reads or writes `tabState`, which is empty until the restore has run (G3).
+    await ensureTabStateRestoredOrLog();
+    if (isTabClosed(tabId)) return;
+
     if (changeInfo.status === 'loading') {
         clearCachedFrameStatusPayloads(tabId);
 
@@ -1553,7 +2190,7 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         const prev = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
         tabState.set(tabId, {
             ...prev,
-            title: tab?.title || prev.title || 'Unknown Tab',
+            title: tab?.title || prev.title || '',
             favIconUrl: tab?.favIconUrl || prev.favIconUrl || '',
             url: tab?.url || prev.url || '',
             windowId: tab?.windowId,
@@ -1592,14 +2229,16 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (typeof changeInfo.audible === 'boolean') {
         const state = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
         const prevAudioActivity = computeHasAudioActivity(state);
+        const hint = resolveAudibleHint(tabId, state, changeInfo.audible);
         tabState.set(tabId, {
             ...state,
-            title: tab.title || state.title || 'Unknown Tab',
+            title: tab.title || state.title || '',
             favIconUrl: tab.favIconUrl || state.favIconUrl || '',
             url: tab.url || state.url || '',
             windowId: tab.windowId,
-            hasMedia: state.hasMedia === true || changeInfo.audible === true,
-            status: changeInfo.audible ? 'active' : (state.status || 'no-media'),
+            hasMedia: hint.hasMedia,
+            status: hint.status,
+            lastMediaSeenAt: hint.fresh ? getNextLastMediaSeenAt(state, hint.hasMedia) : state.lastMediaSeenAt,
             lastSeenAt: Date.now()
         });
 
@@ -1608,10 +2247,17 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
             broadcastAudioStateChanged(tabId);
         }
 
-        if (changeInfo.audible === true && tab?.url && /^(https?|file):/i.test(tab.url)) {
-            scheduleProbeTabStatus(tabId, 80);
+        // Going silent is not proof that the media is gone: ask the frames what they now report.
+        if (tab?.url && /^(https?|file):/i.test(tab.url)) {
+            scheduleProbeTabStatus(tabId, changeInfo.audible ? 80 : 120);
         }
     }
+}
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    handleTabUpdated(tabId, changeInfo, tab).catch((error) => {
+        console.warn('tabs.onUpdated handling failed:', error);
+    });
 });
 
 /**
@@ -1619,17 +2265,11 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
  */
 browser.tabs.onActivated.addListener(async (activeInfo) => {
     const tabId = activeInfo.tabId;
-    let state = tabState.get(tabId);
 
-    if (!state) {
-        // Background-context restarts can wipe in-memory state; restore persisted state if available.
-        try {
-            await restoreTabStateFromStorage();
-        } catch {
-            // ignore
-        }
-        state = tabState.get(tabId);
-    }
+    // Background-context restarts wipe in-memory state; the restore runs before any read (G3).
+    await ensureTabStateRestoredOrLog();
+    if (isTabClosed(tabId)) return;
+    const state = tabState.get(tabId);
 
     if (state) {
         updateIcon(tabId, state.volume, state.corsAffectedCount, { showDefault: true });
@@ -1649,6 +2289,20 @@ browser.tabs.onActivated.addListener(async (activeInfo) => {
     }
 });
 
+browser.tabs.onCreated?.addListener?.((tab) => {
+    // Creation is positive evidence the id is live: a reused id must not stay closed-guarded.
+    if (tab?.id) {
+        recentlyClosedTabIds.delete(tab.id);
+    }
+});
+
+browser.tabs.onAttached?.addListener?.((tabId) => {
+    // Attaching across windows keeps the id and proves the tab is open.
+    if (tabId) {
+        recentlyClosedTabIds.delete(tabId);
+    }
+});
+
 browser.commands?.onCommand?.addListener((command) => {
     handleCommand(command).catch((error) => {
         console.warn('Volume command failed:', error);
@@ -1658,6 +2312,21 @@ browser.commands?.onCommand?.addListener((command) => {
 // Initialize base icon + restore persisted state so toolbar icon doesn't drift.
 (async () => {
     try {
+        if (I18n?.init) {
+            await I18n.init();
+            I18n.startStorageSync?.();
+            I18n.subscribe?.(() => {
+                tabState.forEach((state, tabId) => {
+                    updateIcon(
+                        tabId,
+                        state?.volume ?? CONSTANTS.DEFAULT_VOLUME,
+                        state?.corsAffectedCount ?? 0,
+                        { showDefault: true }
+                    );
+                });
+            });
+        }
+
         const storedPreferences = await browser.storage.local.get([PreferenceKeys.EXTENSION_ENABLED]);
         const preferences = Protocol.normalizeExtensionPreferences(storedPreferences);
 
@@ -1670,7 +2339,7 @@ browser.commands?.onCommand?.addListener((command) => {
             await browser.action.setBadgeTextColor({ color: NATIVE_BADGE_STYLE.textColor });
         }
         await cleanupLegacyPreferenceStorage();
-        await restoreTabStateFromStorage();
+        await ensureTabStateRestored();
 
         // Set icon for active tabs immediately from restored state.
         const activeTabs = await browser.tabs.query({ active: true });
@@ -1692,3 +2361,4 @@ browser.commands?.onCommand?.addListener((command) => {
         console.warn('Background init failed:', e);
     }
 })();
+

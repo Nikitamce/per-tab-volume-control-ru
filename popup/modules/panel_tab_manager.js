@@ -87,14 +87,6 @@ window.Popup.PanelTabManager = {
         this.activeTab = tabId;
         this.updateUI();
         this.saveActiveTab();
-
-        if (tabId === 'other-tabs') {
-            try {
-                window.Popup?.OtherTabsManager?.requestRefresh?.({ forceHydrate: true });
-            } catch {
-                // noop
-            }
-        }
     },
 
     /**

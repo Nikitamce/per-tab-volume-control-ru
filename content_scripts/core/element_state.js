@@ -8,12 +8,16 @@ window.VolumeControl = window.VolumeControl || {};
 (function() {
     const { log, warn, verbose, stateChange } = window.VolumeControl;
     const OPERATION_SCOPES = Object.freeze(['setup', 'sourceChange', 'retry', 'volumeSync']);
+    const STICKY_NATIVE_ONLY_REASONS = Object.freeze([
+        'page-owned-capture-conflict',
+        'capture-error',
+        'capture-lost'
+    ]);
 
     /**
      * Element states enum
      */
     const ElementState = Object.freeze({
-        UNDISCOVERED: 'undiscovered',
         DISCOVERED: 'discovered',
         SETTING_UP: 'setting_up',
         ACTIVE: 'active',
@@ -28,7 +32,6 @@ window.VolumeControl = window.VolumeControl || {};
         CORS: 'cors',
         ALREADY_CAPTURED: 'already_captured',
         INVALID_SOURCE: 'invalid_source',
-        CONTEXT_SUSPENDED: 'context_suspended',
         TIMEOUT: 'timeout',
         UNKNOWN: 'unknown'
     });
@@ -37,7 +40,6 @@ window.VolumeControl = window.VolumeControl || {};
      * Valid state transitions
      */
     const VALID_TRANSITIONS = {
-        [ElementState.UNDISCOVERED]: [ElementState.DISCOVERED],
         [ElementState.DISCOVERED]: [ElementState.SETTING_UP, ElementState.CLEANUP],
         [ElementState.SETTING_UP]: [ElementState.ACTIVE, ElementState.ERROR, ElementState.CLEANUP],
         [ElementState.ACTIVE]: [ElementState.CLEANUP],
@@ -87,11 +89,8 @@ window.VolumeControl = window.VolumeControl || {};
             this.lastAppliedBalance = null;
             this.passthroughMode = false;
             this.volumeSyncHandler = null;
-            
-            // Native-only fallback flag (set when verification detects a
-            // silent mozCaptureStream and control reverts to direct player volume)
-            // native until the element is replaced and re-discovered).
-            this.nativeOnlyFallbackActive = false;
+            // Live page-write mask owned by VolumeController.maskPageVolumeWrite (one per element)
+            this.gainMask = null;
             
             // Source tracking
             this.lastKnownSrc = element.currentSrc || element.src || (element.srcObject ? 'srcObject:attached' : null);
@@ -102,10 +101,16 @@ window.VolumeControl = window.VolumeControl || {};
             this.observedNativeVolume = element.volume;
             this.observedNativeMutedState = element.muted;
             this.managedMutedState = element.muted;
+            // Last volume pushed to the background while the tab was unowned, so a drag
+            // burst does not re-send an unchanged value.
+            this.lastReportedUnownedVolume = null;
+            this.lastReportedMutedState = element.muted;
             
             // Error tracking
             this.errorType = null;
             this.errorMessage = null;
+            // `name` of the thrown error behind the last ERROR transition, when there was one
+            this.errorName = null;
             this.retryCount = 0;
             
             // Visibility tracking
@@ -115,12 +120,20 @@ window.VolumeControl = window.VolumeControl || {};
             this.needsConnectionVerification = false;
             this.consecutiveVerificationFailures = 0;
             this.lastObservedCurrentTime = 0;
+            // The first audio-flow sample only records a baseline; failures count from the second
+            this.flowBaselineTaken = false;
             this.lastVerifiedAudioAt = 0;
             this.detachedSinceAt = null;
             
             // Timers to clean up
             this.verificationTimer = null;
             this.compressionMonitoringInterval = null;
+            this.captureRecoveryTimer = null;
+
+            // Stalled-capture retry budget
+            this.captureRecoveryAttempts = 0;
+            this.captureRecoverySourceKey = null;
+            this.lastCaptureRecoveryAt = 0;
             
             // Event handlers reference
             this.eventHandlers = null;
@@ -128,6 +141,8 @@ window.VolumeControl = window.VolumeControl || {};
             // Async operation coordination
             this.operationEpochs = Object.fromEntries(OPERATION_SCOPES.map(scope => [scope, 0]));
             this.operationTimeouts = Object.fromEntries(OPERATION_SCOPES.map(scope => [scope, new Map()]));
+            // Temporary once-listeners owned by an operation scope; they leave with the scope.
+            this.operationListeners = Object.fromEntries(OPERATION_SCOPES.map(scope => [scope, new Map()]));
         }
 
         _assertOperationScope(scope) {
@@ -143,6 +158,7 @@ window.VolumeControl = window.VolumeControl || {};
                 this.invalidateOperation(otherScope);
             });
             this.clearOperationTimeouts(scope);
+            this.clearOperationListeners(scope);
             this.operationEpochs[scope] += 1;
             return this.operationEpochs[scope];
         }
@@ -150,6 +166,7 @@ window.VolumeControl = window.VolumeControl || {};
         invalidateOperation(scope) {
             this._assertOperationScope(scope);
             this.clearOperationTimeouts(scope);
+            this.clearOperationListeners(scope);
             this.operationEpochs[scope] += 1;
             return this.operationEpochs[scope];
         }
@@ -190,6 +207,47 @@ window.VolumeControl = window.VolumeControl || {};
         }
 
         /**
+         * Attach a temporary once-listener that belongs to an operation scope. One listener per
+         * key: registering the key again replaces the old one. It is removed when the scope is
+         * begun or invalidated again (a superseding operation or a cleanup), or when it fires.
+         * Only listeners registered here are ever removed; other features' listeners stay.
+         */
+        registerOperationListener(scope, key, target, type, handler) {
+            this._assertOperationScope(scope);
+            this.clearOperationListener(scope, key);
+            const listeners = this.operationListeners[scope];
+            const entry = {
+                target,
+                type,
+                handler: (event) => {
+                    if (listeners.get(key) === entry) {
+                        listeners.delete(key);
+                    }
+                    handler(event);
+                }
+            };
+            listeners.set(key, entry);
+            target.addEventListener(type, entry.handler, { once: true });
+        }
+
+        clearOperationListener(scope, key) {
+            this._assertOperationScope(scope);
+            const entry = this.operationListeners[scope].get(key);
+            if (!entry) {
+                return;
+            }
+            this.operationListeners[scope].delete(key);
+            entry.target.removeEventListener(entry.type, entry.handler);
+        }
+
+        clearOperationListeners(scope) {
+            this._assertOperationScope(scope);
+            const listeners = this.operationListeners[scope];
+            listeners.forEach((entry) => entry.target.removeEventListener(entry.type, entry.handler));
+            listeners.clear();
+        }
+
+        /**
          * Check if a transition is valid
          */
         canTransitionTo(newState) {
@@ -213,8 +271,11 @@ window.VolumeControl = window.VolumeControl || {};
             this.state = newState;
             this.lastStateChangeAt = Date.now();
 
-            // Merge additional data
-            Object.assign(this, data);
+            // Merge additional data. An ERROR without an error object forgets the previous name,
+            // so the name never describes an older failure than the message beside it.
+            Object.assign(this, newState === ElementState.ERROR && data.errorName === undefined
+                ? { ...data, errorName: null }
+                : data);
 
             stateChange(`element:${this.elementInfo}`, oldState, newState, 
                 `transition${data.reason ? ` (${data.reason})` : ''}`);
@@ -231,14 +292,6 @@ window.VolumeControl = window.VolumeControl || {};
         }
 
         /**
-         * Check if element is ready for setup
-         */
-        canSetup() {
-            return this.state === ElementState.DISCOVERED || 
-                   (this.state === ElementState.ERROR && this.retryCount < 3);
-        }
-
-        /**
          * Check if element has active audio graph
          */
         isActive() {
@@ -251,6 +304,18 @@ window.VolumeControl = window.VolumeControl || {};
         isTransitioning() {
             return this.state === ElementState.SETTING_UP || 
                    this.state === ElementState.CLEANUP;
+        }
+
+        /**
+         * Forget what was applied to the audio graph that is being dropped. A rebuilt graph
+         * starts from fresh nodes, so a remembered volume, mono state or balance would make
+         * its first apply look unchanged and leave the new nodes at their defaults. These are
+         * the constructor's initial values.
+         */
+        resetAppliedGraphState() {
+            this.lastAppliedVolume = null;
+            this.lastAppliedMonoEnabled = null;
+            this.lastAppliedBalance = null;
         }
 
         /**
@@ -270,6 +335,10 @@ window.VolumeControl = window.VolumeControl || {};
             if (this.compressionMonitoringInterval) {
                 clearInterval(this.compressionMonitoringInterval);
                 this.compressionMonitoringInterval = null;
+            }
+            if (this.captureRecoveryTimer) {
+                clearTimeout(this.captureRecoveryTimer);
+                this.captureRecoveryTimer = null;
             }
         }
     }
@@ -328,32 +397,73 @@ window.VolumeControl = window.VolumeControl || {};
 
         /**
          * Clear CORS-blocked status for an element
-         * Called when source changes, as new source might not have CORS issues
+         * Called when source changes, as new source might not have CORS issues.
+         * The Set and the native-only fields of the state leave together, so the
+         * two never disagree about whether the element is native-only.
          */
         clearCorsBlocked(element) {
-            if (this.corsElements.has(element)) {
-                this.corsElements.delete(element);
+            const wasBlocked = this.corsElements.delete(element);
+            const stateData = this.elements.get(element);
+            if (stateData) {
+                stateData.nativeOnlyReason = null;
+                stateData.nativeOnlySourceKey = null;
+                if (stateData.errorType === ErrorType.CORS) {
+                    stateData.errorType = null;
+                    stateData.errorMessage = null;
+                    stateData.errorName = null;
+                }
+            }
+            if (wasBlocked) {
                 const elementInfo = element ? `${element.tagName}#${element.id || 'no-id'}` : 'unknown';
                 verbose(`[ElementStateManager] Cleared CORS-blocked status for ${elementInfo}`);
             }
         }
 
         /**
+         * Whether the element is native-only for a reason that holds until its source key
+         * changes: a page-owned source, a failed capture, or a capture that was lost (that
+         * one is also revisited on a schedule by Main). Neither the stale-entry sweep nor a
+         * recovery refresh may release such an element, or it would be rebuilt on every
+         * status read. The single definition; do not copy it.
+         */
+        isStickyNativeOnly(element) {
+            const stateData = this.elements.get(element);
+            if (!stateData || !STICKY_NATIVE_ONLY_REASONS.includes(stateData.nativeOnlyReason)) {
+                return false;
+            }
+            const sourceKey = window.VolumeControl.SourceCapture?.getElementSourceKey?.(element)
+                || element.currentSrc
+                || element.src
+                || '';
+            return Boolean(sourceKey) && sourceKey === stateData.nativeOnlySourceKey;
+        }
+
+        /**
          * Clean up stale CORS elements
-         * Removes elements that are:
-         * - No longer connected to DOM
+         * Evicts (through clearCorsBlocked) elements that are:
+         * - Detached from the DOM and no longer playing; a detached element that is
+         *   still playing keeps its native-only registration
          * - No longer have a valid source
          * - Have a source that has changed (might no longer be CORS-blocked)
+         * Lifecycle paths call this (discovery, refresh, removal, setup); a status
+         * getter must not, because it would change what the next read reports.
          * @returns {number} Number of elements cleaned up
          */
         cleanupStaleCorsElements() {
             let cleanedCount = 0;
             const toRemove = [];
+            // A seek is not a stop: nothing calls play() again once it completes.
+            const hasStopped = (element) => Boolean(element.paused || element.ended);
             
             this.corsElements.forEach(element => {
-                // Remove if disconnected from DOM
-                if (!element.isConnected) {
+                // Remove a detached element once it stopped; while it plays, only a changed
+                // source below may evict it.
+                if (!element.isConnected && hasStopped(element)) {
                     toRemove.push(element);
+                    return;
+                }
+
+                if (this.isStickyNativeOnly(element)) {
                     return;
                 }
 
@@ -371,7 +481,13 @@ window.VolumeControl = window.VolumeControl || {};
                 }
                 
                 // Remove if source is now same-origin
-                if (src.startsWith(window.location.origin)) {
+                let isSameOrigin = false;
+                try {
+                    isSameOrigin = new URL(src, window.location.href).origin === window.location.origin;
+                } catch {
+                    isSameOrigin = false;
+                }
+                if (isSameOrigin) {
                     toRemove.push(element);
                     return;
                 }
@@ -384,7 +500,7 @@ window.VolumeControl = window.VolumeControl || {};
             });
             
             toRemove.forEach(element => {
-                this.corsElements.delete(element);
+                this.clearCorsBlocked(element);
                 cleanedCount++;
                 const elementInfo = `${element.tagName}#${element.id || 'no-id'}`;
                 verbose(`[ElementStateManager] Cleaned up stale CORS element: ${elementInfo}`);
@@ -429,29 +545,31 @@ window.VolumeControl = window.VolumeControl || {};
         }
 
         /**
-         * Transition an element to a new state
-         */
-        transition(element, newState, data = {}) {
-            const stateData = this.get(element);
-            if (!stateData) {
-                warn(`[ElementStateManager] Cannot transition unknown element`);
-                return false;
-            }
-            return stateData.transition(newState, data);
-        }
-
-        /**
          * Mark element as CORS-blocked
+         * The Set entry and the ERROR/cors state are written together. A tracked
+         * element that cannot enter ERROR is not registered, so the two never diverge.
+         * @returns {boolean} Whether the element is now registered as native-only
          */
         markCorsBlocked(element) {
-            this.corsElements.add(element);
             const stateData = this.get(element);
-            if (stateData) {
-                stateData.transition(ElementState.ERROR, {
-                    errorType: ErrorType.CORS,
-                    errorMessage: 'Cross-origin media without CORS headers'
-                });
+            if (!stateData) {
+                return false;
             }
+
+            const details = {
+                errorType: ErrorType.CORS,
+                errorMessage: 'Cross-origin media without CORS headers'
+            };
+            // A timeout may already have parked the element in ERROR; ERROR to ERROR is not
+            // a transition, so the native-only details are recorded in place.
+            if (stateData.isState(ElementState.ERROR)) {
+                Object.assign(stateData, details);
+            } else if (!stateData.transition(ElementState.ERROR, details)) {
+                return false;
+            }
+
+            this.corsElements.add(element);
+            return true;
         }
 
         /**
@@ -459,17 +577,6 @@ window.VolumeControl = window.VolumeControl || {};
          */
         isCorsBlocked(element) {
             return this.corsElements.has(element);
-        }
-
-        /**
-         * Get total count of controlled elements (active + CORS)
-         */
-        getTotalControlledCount() {
-            let count = 0;
-            this.elements.forEach(stateData => {
-                if (stateData.state === ElementState.ACTIVE) count++;
-            });
-            return count + this.corsElements.size;
         }
 
         /**

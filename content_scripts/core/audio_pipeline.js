@@ -70,30 +70,43 @@ window.VolumeControl.AudioPipeline = {};
             compressorNode.knee.setValueAtTime(knee, audioContext.currentTime);
             compressorNode.attack.setValueAtTime(DEFAULT_COMPRESSOR_ATTACK, audioContext.currentTime);
             compressorNode.release.setValueAtTime(DEFAULT_COMPRESSOR_RELEASE, audioContext.currentTime);
-            
-            // Pre-compressor gain boost
-            const preCompGainLinear = Math.pow(10, PRE_COMPRESSOR_GAIN_DB / 20);
-            preCompressorGainNode.gain.setValueAtTime(preCompGainLinear, audioContext.currentTime);
-            
-            // Initial makeup gain (will be recalculated when compression enabled)
-            makeupGainNode.gain.setValueAtTime(1.0, audioContext.currentTime);
-
-            // Mono stage averages both channels into dual-mono output.
-            monoLeftGainNode.gain.setValueAtTime(0.5, audioContext.currentTime);
-            monoRightGainNode.gain.setValueAtTime(0.5, audioContext.currentTime);
-
-            if (stereoPannerNode) {
-                stereoPannerNode.pan.setValueAtTime(DEFAULT_BALANCE / 100, audioContext.currentTime);
-            }
-            
-            verbose(`[AudioPipeline] Nodes created with compressor settings:`, {
-                threshold: `${threshold} dB`,
-                ratio: `${ratio}:1`,
-                knee: `${knee} dB`
-            });
         } catch (e) {
             error(`[AudioPipeline] Error setting compressor parameters:`, e);
         }
+
+        try {
+            const preCompGainLinear = Math.pow(10, PRE_COMPRESSOR_GAIN_DB / 20);
+            preCompressorGainNode.gain.setValueAtTime(preCompGainLinear, audioContext.currentTime);
+        } catch (e) {
+            error(`[AudioPipeline] Error setting pre-compressor gain:`, e);
+        }
+
+        try {
+            makeupGainNode.gain.setValueAtTime(1.0, audioContext.currentTime);
+        } catch (e) {
+            error(`[AudioPipeline] Error setting makeup gain:`, e);
+        }
+
+        try {
+            monoLeftGainNode.gain.setValueAtTime(0.5, audioContext.currentTime);
+            monoRightGainNode.gain.setValueAtTime(0.5, audioContext.currentTime);
+        } catch (e) {
+            error(`[AudioPipeline] Error setting mono gains:`, e);
+        }
+
+        try {
+            if (stereoPannerNode) {
+                stereoPannerNode.pan.setValueAtTime(DEFAULT_BALANCE / 100, audioContext.currentTime);
+            }
+        } catch (e) {
+            error(`[AudioPipeline] Error setting pan:`, e);
+        }
+
+        verbose(`[AudioPipeline] Nodes created with compressor settings:`, {
+            threshold: `${threshold} dB`,
+            ratio: `${ratio}:1`,
+            knee: `${knee} dB`
+        });
         
         return {
             source,
@@ -350,23 +363,6 @@ window.VolumeControl.AudioPipeline = {};
     }
 
     /**
-     * Set gain value
-     * @param {GainNode} gainNode - The gain node
-     * @param {AudioContext} audioContext - The audio context
-     * @param {number} gainValue - Linear gain value (0 to 5)
-     */
-    function setGain(gainNode, audioContext, gainValue) {
-        if (!gainNode || !audioContext) return;
-        
-        try {
-            const clampedGain = Math.max(0, Math.min(5, gainValue));
-            gainNode.gain.setValueAtTime(clampedGain, audioContext.currentTime);
-        } catch (e) {
-            error(`[AudioPipeline] Error setting gain:`, e);
-        }
-    }
-
-    /**
      * Check if audio is flowing through the analyser
      * @param {AnalyserNode} analyser - The analyser node
      * @returns {Object} - { hasAudio: boolean, avgAmplitude: number, peakAmplitude: number }
@@ -414,7 +410,6 @@ window.VolumeControl.AudioPipeline = {};
         disconnectGraph,
         updateAudioSettings,
         updateCompressorSettings,
-        setGain,
         checkAudioFlow,
         getCompressorReduction
     };

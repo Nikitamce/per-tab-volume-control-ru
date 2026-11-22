@@ -64,7 +64,23 @@ window.VolumeControl.PRE_COMPRESSOR_GAIN_DB = 6;
 // Timing Constants
 // ============================================
 window.VolumeControl.MUTATION_SCAN_DELAY_MS = 250;
+window.VolumeControl.MUTATION_MAX_WAIT_MS = 1000;
+window.VolumeControl.MUTATION_PENDING_CAP = 500;
 window.VolumeControl.STORAGE_WRITE_DEBOUNCE_MS = 500;
+
+// ============================================
+// Media Detection
+// ============================================
+// CustomEvent that the MAIN-world play hook (detection/play_hook_main.js) dispatches on document
+// with the playing element as `detail`. The hook runs in the page world and cannot load this file,
+// so it repeats the literal; tests/main-world-play-hook.test.js keeps the two equal.
+window.VolumeControl.PLAY_HOOK_EVENT = '__vc_play';
+// Same contract for the MAIN-world element.volume setter hook (detection/volume_hook_main.js): the
+// event is dispatched synchronously inside the page's own write, with the element as `detail`.
+window.VolumeControl.VOLUME_HOOK_EVENT = '__vc_volume';
+// The periodic safety scan skips its document walk while no DOM mutation was recorded, but still
+// walks once every N ticks (shadow roots can gain media without any observed mutation).
+window.VolumeControl.PERIODIC_SCAN_FORCE_EVERY_TICKS = 4;
 
 // ============================================
 // Setup / Retry Constants
@@ -75,7 +91,6 @@ window.VolumeControl.SETUP_TIMEOUT_MS = 5000;
 // Volume Sync Timing
 // ============================================
 window.VolumeControl.EXTENSION_VOLUME_LOCK_TIMEOUT_MS = 150;
-
 // ============================================
 // Misc
 // ============================================

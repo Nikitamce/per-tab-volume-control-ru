@@ -26,11 +26,29 @@
         DEFAULT_BALANCE: 'defaultBalance'
     });
 
+    const VolumeControlMode = Object.freeze({
+        UNMANAGED: 'unmanaged',
+        MANAGED: 'managed'
+    });
+
+    const VolumeControlSource = Object.freeze({
+        EXTENSION: 'extension',
+        PLAYER_USER: 'player-user',
+        PLAYER_INITIAL: 'player-initial',
+        RESTORED: 'restored',
+        LEGACY: 'legacy'
+    });
+
     const Messages = Object.freeze({
         STATUS_UPDATE: 'STATUS_UPDATE',
+        FRAME_STATUS_REMOVED: 'FRAME_STATUS_REMOVED',
         GET_STATUS: 'GET_STATUS',
         GET_TAB_STATUS: 'GET_TAB_STATUS',
-        INSTALL_PAGE_MEDIA_BRIDGE: 'INSTALL_PAGE_MEDIA_BRIDGE',
+        GET_TAB_VOLUME_CONTROL: 'GET_TAB_VOLUME_CONTROL',
+        COMMIT_TAB_VOLUME_CONTROL: 'COMMIT_TAB_VOLUME_CONTROL',
+        TAB_VOLUME_CONTROL_UPDATED: 'TAB_VOLUME_CONTROL_UPDATED',
+        REPORT_PLAYER_VOLUME_INTENT: 'REPORT_PLAYER_VOLUME_INTENT',
+        PLAYER_VOLUME_INTENT: 'PLAYER_VOLUME_INTENT',
         SET_VOLUME: 'SET_VOLUME',
         SET_COMPRESSION: 'SET_COMPRESSION',
         SET_AUDIO_SETTINGS: 'SET_AUDIO_SETTINGS',
@@ -55,12 +73,44 @@
         'no-media': 1
     });
 
+    // Higher = more settled / preferred when top-level status priority is equal.
+    // Transitional details (setting-up / connecting) must lose to a healthy Connected payload.
+    const STATUS_DETAIL_PRIORITY = Object.freeze({
+        'manual-disabled': 60,
+        limited: 55,
+        paused: 40,
+        error: 30,
+        'no-source': 20,
+        detecting: 15,
+        'setting-up': 5,
+        connecting: 5
+    });
+    const NATIVE_PERCENT_SNAP_EPSILON = 1e-7;
+
+    function statusDetailPriority(statusDetail) {
+        if (statusDetail == null) {
+            return 50;
+        }
+        return STATUS_DETAIL_PRIORITY[statusDetail] ?? 25;
+    }
+
     function statusPayloadHasMedia(payload) {
         const source = payload && typeof payload === 'object' ? payload : {};
         return source.status === 'active' ||
             source.status === 'inactive' ||
             source.status === 'error' ||
             (source.elementCounts && Number(source.elementCounts.total) > 0);
+    }
+
+    /**
+     * Prefer an explicit next value (including null) over a previous sticky value.
+     * Only fall back when the next value is undefined / missing.
+     */
+    function coalesceExplicit(nextValue, previousValue, fallback = null) {
+        if (nextValue !== undefined) {
+            return nextValue;
+        }
+        return previousValue !== undefined ? previousValue : fallback;
     }
 
     function clamp(value, min, max) {
@@ -78,6 +128,42 @@
             return fallback;
         }
         return clamp(Math.round(candidate), CONSTANTS.MIN_VOLUME, CONSTANTS.MAX_VOLUME);
+    }
+
+    function floorWithNearIntegerSnap(value) {
+        const nearestInteger = Math.round(value);
+        return Math.abs(value - nearestInteger) <= NATIVE_PERCENT_SNAP_EPSILON
+            ? nearestInteger
+            : Math.floor(value);
+    }
+
+    /**
+     * Convert HTMLMediaElement.volume (0..1) to a whole native percent.
+     * Floor real fractional steps so the extension never displays the next
+     * percent before the player reaches it, while snapping tiny IEEE-754 noise
+     * around exact hundredths back to the intended integer.
+     */
+    function nativeVolumeToPercent(value, fallback = CONSTANTS.DEFAULT_VOLUME) {
+        const candidate = parseFiniteNumber(value);
+        if (candidate === undefined) {
+            return clamp(normalizeVolume(fallback), CONSTANTS.MIN_VOLUME, CONSTANTS.DEFAULT_VOLUME);
+        }
+
+        const scaled = clamp(candidate, 0, 1) * CONSTANTS.DEFAULT_VOLUME;
+        const wholePercent = floorWithNearIntegerSnap(scaled);
+        return clamp(wholePercent, CONSTANTS.MIN_VOLUME, CONSTANTS.DEFAULT_VOLUME);
+    }
+
+    function normalizeObservedVolume(value, fallback = CONSTANTS.DEFAULT_VOLUME) {
+        const candidate = parseFiniteNumber(value);
+        if (candidate === undefined) {
+            return clamp(normalizeVolume(fallback), CONSTANTS.MIN_VOLUME, CONSTANTS.DEFAULT_VOLUME);
+        }
+        return clamp(
+            floorWithNearIntegerSnap(candidate),
+            CONSTANTS.MIN_VOLUME,
+            CONSTANTS.DEFAULT_VOLUME
+        );
     }
 
     function normalizeBalance(value, fallback = CONSTANTS.DEFAULT_BALANCE) {
@@ -270,14 +356,121 @@
         return fallback;
     }
 
+    function createUnmanagedVolumeControl(fallbackVolume = CONSTANTS.DEFAULT_VOLUME) {
+        return {
+            mode: VolumeControlMode.UNMANAGED,
+            targetVolume: normalizeVolume(fallbackVolume, CONSTANTS.DEFAULT_VOLUME),
+            source: null,
+            revision: 0
+        };
+    }
+
+    function createManagedVolumeControl(targetVolume, source, revision = 1) {
+        return {
+            mode: VolumeControlMode.MANAGED,
+            targetVolume: normalizeVolume(targetVolume, CONSTANTS.DEFAULT_VOLUME),
+            source: source || VolumeControlSource.EXTENSION,
+            revision: Math.max(1, Math.floor(Number(revision) || 1))
+        };
+    }
+
+    function normalizeVolumeControl(input, fallbackVolume = CONSTANTS.DEFAULT_VOLUME) {
+        const source = input && typeof input === 'object' ? input : {};
+        const fallback = createUnmanagedVolumeControl(fallbackVolume);
+
+        if (source.mode === VolumeControlMode.MANAGED) {
+            return createManagedVolumeControl(
+                source.targetVolume ?? fallback.targetVolume,
+                source.source ?? VolumeControlSource.EXTENSION,
+                source.revision ?? 1
+            );
+        }
+
+        return {
+            mode: VolumeControlMode.UNMANAGED,
+            targetVolume: normalizeVolume(source.targetVolume ?? fallback.targetVolume, fallback.targetVolume),
+            source: null,
+            revision: Math.max(0, Math.floor(Number(source.revision) || 0))
+        };
+    }
+
+    function isManagedVolumeControl(control) {
+        return Boolean(control && control.mode === VolumeControlMode.MANAGED);
+    }
+
+    function volumeControlsEqual(left, right) {
+        return Boolean(
+            left &&
+            right &&
+            left.mode === right.mode &&
+            left.targetVolume === right.targetVolume &&
+            left.source === right.source &&
+            Math.floor(Number(left.revision) || 0) === Math.floor(Number(right.revision) || 0)
+        );
+    }
+
+    function shouldAcceptVolumeControlUpdate(current, incoming, options = {}) {
+        const allowEqualDifferent = options.allowEqualDifferent !== false;
+        if (!incoming || typeof incoming !== 'object') {
+            return false;
+        }
+        if (!current) {
+            return true;
+        }
+        const currentRevision = Math.floor(Number(current.revision) || 0);
+        const incomingRevision = Math.floor(Number(incoming.revision) || 0);
+        if (incomingRevision > currentRevision) {
+            return true;
+        }
+        if (incomingRevision < currentRevision) {
+            return false;
+        }
+        if (volumeControlsEqual(current, incoming)) {
+            return true;
+        }
+        return allowEqualDifferent;
+    }
+
+    function volumeControlToOwnership(control) {
+        if (!isManagedVolumeControl(control)) {
+            return 'unowned';
+        }
+        switch (control.source) {
+            case VolumeControlSource.PLAYER_USER:
+                return 'player-user';
+            case VolumeControlSource.PLAYER_INITIAL:
+                return 'player-initial';
+            case VolumeControlSource.RESTORED:
+            case VolumeControlSource.LEGACY:
+                return 'restored';
+            case VolumeControlSource.EXTENSION:
+            default:
+                return 'extension';
+        }
+    }
+
+    function resolveAuthoritativeVolume(volumeControl, telemetryVolume, fallback = CONSTANTS.DEFAULT_VOLUME) {
+        if (isManagedVolumeControl(volumeControl)) {
+            return volumeControl.targetVolume;
+        }
+        if (Number.isFinite(Number(telemetryVolume))) {
+            return normalizeVolume(telemetryVolume, fallback);
+        }
+        return normalizeVolume(fallback, CONSTANTS.DEFAULT_VOLUME);
+    }
+
     function normalizeStatusPayload(payload, fallback = {}) {
         const source = payload && typeof payload === 'object' ? payload : {};
         const defaults = fallback && typeof fallback === 'object' ? fallback : {};
+        const observedVolume = source.observedVolume !== undefined
+            ? normalizeObservedVolume(source.observedVolume, defaults.observedVolume ?? defaults.volume ?? CONSTANTS.DEFAULT_VOLUME)
+            : undefined;
 
         return {
             status: source.status || defaults.status || 'inactive',
-            statusDetail: source.statusDetail ?? defaults.statusDetail ?? null,
+            statusDetail: coalesceExplicit(source.statusDetail, defaults.statusDetail, null),
             volume: normalizeVolume(source.volume, defaults.volume ?? CONSTANTS.DEFAULT_VOLUME),
+            observedVolume,
             extensionEnabled: typeof source.extensionEnabled === 'boolean'
                 ? source.extensionEnabled
                 : (typeof defaults.extensionEnabled === 'boolean' ? defaults.extensionEnabled : true),
@@ -292,36 +485,61 @@
                 source.audioSettingsAvailable,
                 defaults.audioSettingsAvailable ?? true
             ),
-            audioSettingsReason: source.audioSettingsReason ?? defaults.audioSettingsReason ?? null,
+            audioSettingsReason: coalesceExplicit(source.audioSettingsReason, defaults.audioSettingsReason, null),
             corsAffectedCount: normalizeCorsCount(source.corsAffectedCount ?? defaults.corsAffectedCount),
             elementCounts: source.elementCounts ?? defaults.elementCounts
         };
     }
 
-    function mergeStatusPayloads(payloads, fallback = {}) {
+    function isPreferredStatusPayload(candidate, current) {
+        const candidatePriority = STATUS_PRIORITY[candidate.status] || 0;
+        const currentPriority = STATUS_PRIORITY[current.status] || 0;
+        if (candidatePriority !== currentPriority) {
+            return candidatePriority > currentPriority;
+        }
+
+        const candidateActive = Number(candidate.elementCounts?.active) || 0;
+        const currentActive = Number(current.elementCounts?.active) || 0;
+        if (candidateActive !== currentActive) {
+            return candidateActive > currentActive;
+        }
+
+        const candidateDetailPriority = statusDetailPriority(candidate.statusDetail);
+        const currentDetailPriority = statusDetailPriority(current.statusDetail);
+        if (candidateDetailPriority !== currentDetailPriority) {
+            return candidateDetailPriority > currentDetailPriority;
+        }
+
+        const candidateTotal = Number(candidate.elementCounts?.total) || 0;
+        const currentTotal = Number(current.elementCounts?.total) || 0;
+        return candidateTotal > currentTotal;
+    }
+
+    function mergeStatusPayloads(payloads, fallback = {}, volumeControl = null) {
         const defaults = normalizeStatusPayload(undefined, fallback);
         const normalizedPayloads = (payloads || [])
             .map((payload) => normalizeStatusPayload(payload?.payload ?? payload, defaults));
 
         if (normalizedPayloads.length === 0) {
-            return { ...defaults };
+            const empty = { ...defaults };
+            if (isManagedVolumeControl(volumeControl)) {
+                empty.volume = volumeControl.targetVolume;
+            }
+            return empty;
         }
 
         let bestPayload = normalizedPayloads[0];
-        let bestPriority = STATUS_PRIORITY[bestPayload.status] || 0;
-        let bestElementCount = bestPayload.elementCounts?.total || 0;
-
         for (const payload of normalizedPayloads.slice(1)) {
-            const priority = STATUS_PRIORITY[payload.status] || 0;
-            const elementCount = payload.elementCounts?.total || 0;
-            if (priority > bestPriority || (priority === bestPriority && elementCount > bestElementCount)) {
+            if (isPreferredStatusPayload(payload, bestPayload)) {
                 bestPayload = payload;
-                bestPriority = priority;
-                bestElementCount = elementCount;
             }
         }
 
         const merged = normalizeStatusPayload(bestPayload, defaults);
+        const preferredObserved = bestPayload.observedVolume ?? bestPayload.volume;
+        if (Number.isFinite(Number(preferredObserved))) {
+            merged.observedVolume = normalizeVolume(preferredObserved, merged.volume);
+        }
         merged.corsAffectedCount = normalizedPayloads.reduce(
             (maxCount, payload) => Math.max(maxCount, payload.corsAffectedCount || 0),
             merged.corsAffectedCount || 0
@@ -329,6 +547,10 @@
         merged.elementCounts = {
             total: normalizedPayloads.reduce(
                 (total, payload) => total + (payload.elementCounts?.total || 0),
+                0
+            ),
+            active: normalizedPayloads.reduce(
+                (total, payload) => total + (Number(payload.elementCounts?.active) || 0),
                 0
             )
         };
@@ -342,9 +564,23 @@
 
         if (!merged.audioSettingsAvailable) {
             merged.audioSettingsReason = blockingPayload?.audioSettingsReason ?? merged.audioSettingsReason ?? null;
+        } else {
+            merged.audioSettingsReason = null;
         }
 
         merged.extensionEnabled = !normalizedPayloads.some((payload) => payload.extensionEnabled === false);
+
+        // The preferred frame can be a muted autoplay/ad frame; any frame with audible
+        // playback means the tab is not muted.
+        if ((payloads || []).some((payload) => (payload?.payload ?? payload)?.audible === true)) {
+            merged.muted = false;
+        }
+
+        merged.volume = resolveAuthoritativeVolume(
+            volumeControl,
+            merged.observedVolume ?? merged.volume,
+            defaults.volume ?? CONSTANTS.DEFAULT_VOLUME
+        );
 
         return merged;
     }
@@ -353,7 +589,7 @@
         const source = tab && typeof tab === 'object' ? tab : {};
         return {
             tabId: source.tabId,
-            title: source.title || 'Unknown Tab',
+            title: source.title || '',
             favIconUrl: source.favIconUrl || '',
             url: source.url || '',
             volume: normalizeVolume(source.volume, CONSTANTS.DEFAULT_VOLUME),
@@ -377,8 +613,19 @@
         CONSTANTS,
         PreferenceKeys,
         Messages,
+        VolumeControlMode,
+        VolumeControlSource,
         STATUS_PRIORITY,
+        createUnmanagedVolumeControl,
+        createManagedVolumeControl,
+        normalizeVolumeControl,
+        isManagedVolumeControl,
+        volumeControlsEqual,
+        shouldAcceptVolumeControlUpdate,
+        volumeControlToOwnership,
+        resolveAuthoritativeVolume,
         normalizeVolume,
+        nativeVolumeToPercent,
         normalizeBalance,
         normalizeCorsCount,
         sanitizeVolumeInput,
@@ -391,6 +638,8 @@
         normalizeAudioSettings,
         normalizeStatusPayload,
         statusPayloadHasMedia,
+        coalesceExplicit,
+        statusDetailPriority,
         mergeStatusPayloads,
         normalizeAudioTab
     });

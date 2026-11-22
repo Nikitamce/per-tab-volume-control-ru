@@ -37,21 +37,34 @@ window.VolumeControl = window.VolumeControl || {};
         return Array.from(document.querySelectorAll('video, audio'));
     }
 
+    function isMediaPlaying(element) {
+        return !element.paused && !element.ended;
+    }
+
+    // Muted autoplay previews are common next to the real player; the one the user
+    // hears must represent the frame.
+    function isMediaAudible(element) {
+        return isMediaPlaying(element) && !element.muted && element.volume > 0;
+    }
+
+    function toRepresentativeMediaState(candidate) {
+        const rawVolume = Number.isFinite(candidate.volume) ? candidate.volume : 1;
+        return {
+            volume: Protocol.nativeVolumeToPercent(rawVolume),
+            muted: Boolean(candidate.muted),
+            audible: isMediaAudible(candidate)
+        };
+    }
+
     function getRepresentativeMediaState(mediaElements) {
         if (!Array.isArray(mediaElements) || mediaElements.length === 0) {
             return null;
         }
 
-        const candidate = mediaElements.find((element) => !element.paused && !element.ended) || mediaElements[0];
-        if (!candidate) {
-            return null;
-        }
-
-        const rawVolume = Number.isFinite(candidate.volume) ? candidate.volume : 1;
-        return {
-            volume: Math.max(MIN_VOLUME, Math.min(MAX_VOLUME, Math.round(rawVolume * DEFAULT_VOLUME))),
-            muted: Boolean(candidate.muted)
-        };
+        const candidate = mediaElements.find(isMediaAudible) ||
+            mediaElements.find(isMediaPlaying) ||
+            mediaElements[0];
+        return candidate ? toRepresentativeMediaState(candidate) : null;
     }
 
     function getTrackedRepresentativeMediaState(stateManager) {
@@ -70,7 +83,8 @@ window.VolumeControl = window.VolumeControl || {};
             candidates.push({
                 element,
                 priority,
-                isPlaying: !element.paused && !element.ended,
+                isAudible: isMediaAudible(element),
+                isPlaying: isMediaPlaying(element),
                 isVisible: stateData?.isIntersecting !== false,
                 lastStateChangeAt: Number(stateData?.lastStateChangeAt) || 0,
                 currentTime: Number.isFinite(element.currentTime) ? element.currentTime : -1
@@ -96,6 +110,7 @@ window.VolumeControl = window.VolumeControl || {};
         }
 
         candidates.sort((left, right) =>
+            Number(right.isAudible) - Number(left.isAudible) ||
             Number(right.isPlaying) - Number(left.isPlaying) ||
             Number(right.isVisible) - Number(left.isVisible) ||
             right.lastStateChangeAt - left.lastStateChangeAt ||
@@ -104,28 +119,44 @@ window.VolumeControl = window.VolumeControl || {};
         );
 
         const candidate = candidates[0]?.element;
-        if (!candidate) {
-            return null;
-        }
-
-        const rawVolume = Number.isFinite(candidate.volume) ? candidate.volume : 1;
-        return {
-            volume: Math.max(MIN_VOLUME, Math.min(MAX_VOLUME, Math.round(rawVolume * DEFAULT_VOLUME))),
-            muted: Boolean(candidate.muted)
-        };
+        return candidate ? toRepresentativeMediaState(candidate) : null;
     }
 
     function getPreferredLiveMediaState(mediaElements, stateManager) {
         return getTrackedRepresentativeMediaState(stateManager) || getRepresentativeMediaState(mediaElements);
     }
 
+    // Capture state does not matter here: a player the user unmuted can still be setting
+    // up or uncaptured while a muted preview is the representative element.
+    function isFrameAudible(mediaElements, stateManager) {
+        if (mediaElements.some(isMediaAudible)) {
+            return true;
+        }
+        let audible = false;
+        stateManager?.elements?.forEach?.((stateData, element) => {
+            if (!audible && element && isMediaAudible(element)) {
+                audible = true;
+            }
+        });
+        return audible;
+    }
+
     // --- Status Reporting ---
+
+    // True from pagehide (or unload) until pageshow. The background dropped this frame's cached
+    // status when FRAME_STATUS_REMOVED arrived, so a debounced push from the hidden frame
+    // would put it back.
+    let frameRemovalReported = false;
 
     /**
      * Sends the current status to the popup via runtime messaging.
      * Uses getCurrentStatus() as single source of truth for consistency.
      */
     window.VolumeControl.notifyPopupOfStatusChange = function() {
+        if (frameRemovalReported) {
+            return;
+        }
+
         // Defer to getCurrentStatus for consistent status logic
         // Note: getCurrentStatus is defined below after this function
         const statusPayload = window.__volumeControlExtension__?.getCurrentStatus?.();
@@ -158,7 +189,7 @@ window.VolumeControl = window.VolumeControl || {};
         const isTopLevel = window === window.top;
         const isActive = statusPayload.status === 'active';
         if (!isTopLevel && !isActive) {
-            const hasMediaElements = statusPayload.status === 'inactive' || statusPayload.status === 'error' ||
+            const hasMediaElements = statusPayload.status === 'inactive' ||
                 (statusPayload.elementCounts && statusPayload.elementCounts.total > 0) ||
                 getFrameMediaElements().length > 0;
             if (!hasMediaElements) {
@@ -234,11 +265,8 @@ window.VolumeControl = window.VolumeControl || {};
 
         const audioSettingsCapability = Main.getAudioSettingsAvailability();
         
-        // Clean up stale CORS elements before counting
-        if (stateManager) {
-            stateManager.cleanupStaleCorsElements();
-        }
-        
+        // Counting is read-only for native-only elements: stale entries are pruned by the
+        // lifecycle paths in Main (discovery, refresh, removal, setup), never by a status read.
         // Get detailed counts for accurate status
         const stateCounts = stateManager ? stateManager.getStateCounts() : {};
         const activeCount = stateCounts[ElementState?.ACTIVE] || 0;
@@ -254,6 +282,10 @@ window.VolumeControl = window.VolumeControl || {};
         let status;
         let statusDetail = null;
         
+        const recoveryTargets = (elements) => (elements || []).filter(
+            (element) => stateManager?.isStickyNativeOnly?.(element) !== true
+        );
+
         if (activeCount > 0) {
             // We have active audio control
             status = 'active';
@@ -273,8 +305,10 @@ window.VolumeControl = window.VolumeControl || {};
             );
             
             if (hasPlayingMedia) {
-                // Media is playing but we haven't captured it yet - trigger rescan
-                Main.refreshDetectedMediaState?.(mediaElements, 'status-playing-recovery');
+                const targets = recoveryTargets(mediaElements);
+                if (targets.length > 0) {
+                    Main.refreshDetectedMediaState?.(targets, 'status-playing-recovery');
+                }
                 status = 'active';
                 statusDetail = 'connecting';
             } else {
@@ -295,8 +329,10 @@ window.VolumeControl = window.VolumeControl || {};
                 });
                 
                 if (hasValidMedia) {
-                    // Trigger scan to pick up the media
-                    Main.refreshDetectedMediaState?.(mediaElements, 'status-detecting-recovery');
+                    const targets = recoveryTargets(mediaElements);
+                    if (targets.length > 0) {
+                        Main.refreshDetectedMediaState?.(targets, 'status-detecting-recovery');
+                    }
                     status = 'inactive';
                     statusDetail = 'detecting';
                 } else {
@@ -311,28 +347,38 @@ window.VolumeControl = window.VolumeControl || {};
 
         const shouldUseLiveMediaState = Boolean(representativeMediaState) && (
             State.extensionEnabled === false ||
-            (!State.volumeHasBeenSet && activeCount === 0) ||
+            window.VolumeControl.VolumeOwnership?.shouldUseLiveObservedVolume?.() ||
             (activeCount === 0 && corsCount === 0 && status !== 'active')
         );
 
-        const reportedVolume = shouldUseLiveMediaState
+        const observedVolume = representativeMediaState
             ? representativeMediaState.volume
             : State.currentVolumePercent;
+        const reportedVolume = window.VolumeControl.VolumeOwnership?.isManaged?.()
+            ? State.currentVolumePercent
+            : (shouldUseLiveMediaState ? observedVolume : State.currentVolumePercent);
         const shouldUseLiveMuteState = Boolean(representativeMediaState) && (
             State.extensionEnabled === false ||
             !State.muteHasBeenSet ||
             shouldUseLiveMediaState
         );
-        const reportedMuted = shouldUseLiveMuteState
-            ? representativeMediaState.muted
-            : Boolean(State.currentMutedState);
+        // Extension mute sets element.muted, so audible media always means the frame
+        // is not muted, including after the page's own player unmuted it.
+        const frameAudible = isFrameAudible(mediaElements, stateManager);
+        const reportedMuted = frameAudible
+            ? false
+            : (shouldUseLiveMuteState
+                ? representativeMediaState.muted
+                : Boolean(State.currentMutedState));
         
         return {
             status: status,
             statusDetail: statusDetail,
             volume: reportedVolume,
+            observedVolume,
             extensionEnabled: State.extensionEnabled !== false,
             muted: reportedMuted,
+            audible: frameAudible,
             monoEnabled: State.currentMonoEnabled,
             balance: State.currentBalance,
             compressionEnabled: State.currentCompressionEnabled,
@@ -357,9 +403,10 @@ window.VolumeControl = window.VolumeControl || {};
     /**
      * Set volume from popup
      */
-    window.__volumeControlExtension__.setVolume = (volumePayload) => {
+    window.__volumeControlExtension__.setVolume = async (volumePayload) => {
         const State = getState();
         const Main = getMain();
+        const VolumeOwnership = window.VolumeControl.VolumeOwnership;
         
         const { requestedVolume, source, summary } = Protocol.parseVolumeCommandPayload(volumePayload);
         const seq = ++State.volumeCommandSequence;
@@ -369,17 +416,16 @@ window.VolumeControl = window.VolumeControl || {};
         const normalizedRequest = Number.isFinite(requestedVolume) ? requestedVolume : State.currentVolumePercent;
         const clampedVolume = Math.max(MIN_VOLUME, Math.min(MAX_VOLUME, Math.round(normalizedRequest)));
 
-        if (clampedVolume === State.currentVolumePercent) {
-            log(`[VOLUME CMD #${seq}] No change (already at ${State.currentVolumePercent}%).`);
+        if (clampedVolume === State.currentVolumePercent && VolumeOwnership.isManaged()) {
+            log(`[VOLUME CMD #${seq}] No change (already managed at ${State.currentVolumePercent}%).`);
             return;
         }
 
         log(`[VOLUME CMD #${seq}] Applying ${clampedVolume}% (was ${State.currentVolumePercent}%).`);
+
+        const control = await VolumeOwnership.commitExtensionVolume(clampedVolume);
+        Main.updateAllVolume(control?.targetVolume ?? clampedVolume);
         
-        // Use Main module to update all elements
-        Main.updateAllVolume(clampedVolume);
-        
-        // Notify popup
         window.VolumeControl.notifyPopupOfStatusChange();
     };
 
@@ -436,9 +482,14 @@ window.VolumeControl = window.VolumeControl || {};
         window.VolumeControl.notifyPopupOfStatusChange();
     };
 
+    // A runtime `SET_EXTENSION_ENABLED` that arrives while `init` still awaits the stored
+    // preferences is newer than what storage returns, so the stored value must not replace it.
+    let runtimeExtensionEnabled = null;
+
     window.__volumeControlExtension__.setExtensionEnabled = (enabled) => {
         const Main = getMain();
         const nextEnabled = enabled !== false;
+        runtimeExtensionEnabled = nextEnabled;
 
         log(`[ExtensionEnabled] Setting enabled=${nextEnabled}`);
         Main.setExtensionEnabled(nextEnabled);
@@ -451,8 +502,15 @@ window.VolumeControl = window.VolumeControl || {};
         if (message.type === Messages.GET_STATUS) {
             sendResponse(window.__volumeControlExtension__.getCurrentStatus());
         } else if (message.type === Messages.SET_VOLUME) {
-            window.__volumeControlExtension__.setVolume(message.payload);
-            sendResponse({ success: true });
+            (async () => {
+                try {
+                    await window.__volumeControlExtension__.setVolume(message.payload);
+                    sendResponse({ success: true });
+                } catch (error) {
+                    sendResponse({ success: false, error: error?.message || String(error) });
+                }
+            })();
+            return true;
         } else if (message.type === Messages.SET_COMPRESSION) {
             window.__volumeControlExtension__.setCompressionSettings(message.payload);
             sendResponse({ success: true });
@@ -489,7 +547,6 @@ window.VolumeControl = window.VolumeControl || {};
                 preferences
             });
 
-            State.extensionEnabled = resolvedPageState.extensionEnabled;
             State.defaultCompressionEnabled = preferences.defaultCompressionEnabled;
             State.defaultMonoEnabled = preferences.defaultMonoEnabled;
             State.defaultBalanceEnabled = preferences.defaultBalanceEnabled;
@@ -504,6 +561,21 @@ window.VolumeControl = window.VolumeControl || {};
             State.compressionHasBeenSet = resolvedPageState.compressionInitialised;
             State.monoHasBeenSet = resolvedPageState.monoInitialised;
             State.balanceHasBeenSet = resolvedPageState.balanceInitialised;
+
+            // Applied after the rest of the state is in place, through the runtime path in both
+            // directions: a status probe or the play hook can set an element up before the
+            // preferences arrive, and only that path restores or resumes such an element. The
+            // flag defaults to true, so an enabled preference is a no-op there and element
+            // recovery still does not start before init has hydrated. A runtime command that
+            // already arrived wins over the stored value (it is the newer of the two).
+            const Main = getMain();
+            if (runtimeExtensionEnabled !== null) {
+                verbose('[Preferences] A runtime extension toggle arrived during init; keeping it');
+            } else if (typeof Main?.setExtensionEnabled === 'function') {
+                Main.setExtensionEnabled(resolvedPageState.extensionEnabled);
+            } else {
+                State.extensionEnabled = resolvedPageState.extensionEnabled;
+            }
         } catch (e) {
             warn('[Preferences] Failed to load extension preferences:', e);
         }
@@ -520,8 +592,31 @@ window.VolumeControl = window.VolumeControl || {};
         const Main = getMain();
         const MediaDetector = getMediaDetector();
         const Compressor = window.VolumeControl.Compressor;
+        const reportFrameRemoval = () => {
+            if (frameRemovalReported) {
+                return;
+            }
+            frameRemovalReported = true;
+            try {
+                void Promise.resolve(browser.runtime.sendMessage({
+                    type: Messages.FRAME_STATUS_REMOVED
+                })).catch(() => {});
+            } catch {
+                // Runtime may already be unavailable during final teardown.
+            }
+        };
+
+        window.addEventListener('pagehide', reportFrameRemoval, { passive: true });
+        window.addEventListener('pageshow', () => {
+            if (!frameRemovalReported) {
+                return;
+            }
+            frameRemovalReported = false;
+            window.VolumeControl.notifyPopupOfStatusChange?.();
+        }, { passive: true });
 
         window.addEventListener('unload', () => {
+            reportFrameRemoval();
             log("Page unloading, cleaning up...");
             
             // Flush pending storage writes immediately
@@ -571,24 +666,46 @@ window.VolumeControl = window.VolumeControl || {};
      * Main initialization function
      */
     (async function init() {
-        const Main = getMain();
-        
-        log(`Content script executing... Location: ${window.location.href}, Top: ${window.self === window.top}`);
-        
-        // Load persisted settings from sessionStorage
-        window.VolumeControl.loadSettingsFromStorage();
-        await loadExtensionPreferences();
-        
-        // Initialize main module (handles detection, setup, etc.)
-        Main.initialize();
-        
-        // Set up cleanup
-        setupUnloadCleanup();
+        let unloadCleanupInstalled = false;
+        try {
+            const Main = getMain();
+            const State = getState();
+            const VolumeOwnership = window.VolumeControl.VolumeOwnership;
 
-        // Mark as active
-        window.volumeControlActive = true;
-        window.__volumeControlExtension__.active = true;
-        
-        log("Content script loaded and ready.");
+            log(`Content script executing... Location: ${window.location.href}, Top: ${window.self === window.top}`);
+
+            window.VolumeControl.loadSettingsFromStorage();
+            await loadExtensionPreferences();
+            if (VolumeOwnership?.hydrateFromBackground) {
+                await VolumeOwnership.hydrateFromBackground();
+            }
+
+            if (VolumeOwnership && !VolumeOwnership.isManaged() && Number.isFinite(State.__legacyRestoredVolume)) {
+                await VolumeOwnership.commitRestoredVolume(State.__legacyRestoredVolume);
+                delete State.__legacyRestoredVolume;
+            }
+
+            Main.initialize();
+
+            setupUnloadCleanup();
+            unloadCleanupInstalled = true;
+
+            window.volumeControlActive = true;
+            window.__volumeControlExtension__.active = true;
+
+            log("Content script loaded and ready.");
+        } catch (initError) {
+            // The frame stays half initialised: the page keeps its own audio, and the active
+            // flags stay unset. Teardown is still wired so anything `Main.initialize` managed
+            // to start is cleaned up and the background hears that the frame is gone.
+            error('[Init] Content script initialisation failed:', initError);
+            if (!unloadCleanupInstalled) {
+                try {
+                    setupUnloadCleanup();
+                } catch (cleanupError) {
+                    verbose('[Init] Unload cleanup could not be installed:', cleanupError);
+                }
+            }
+        }
     })();
 })();

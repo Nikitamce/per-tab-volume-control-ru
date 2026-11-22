@@ -25,8 +25,9 @@ window.Popup.Constants = {
     RESET_COMPRESSION_THRESHOLD: -18,
     RESET_COMPRESSION_RATIO: 6,
     
-    // Debounce Timing
+    // Debounce / throttle timing
     VOLUME_DEBOUNCE_MS: 150,
+    VOLUME_SEND_THROTTLE_MS: 100,
     COMPRESSION_DEBOUNCE_MS: 200,
     AUDIO_SETTINGS_DEBOUNCE_MS: 120,
     SETTINGS_SAVE_DEBOUNCE_MS: 160,
@@ -48,32 +49,32 @@ window.Popup.Constants = {
     VIEW_SETTINGS: 'settings-view',
     VIEW_SHORTCUTS: 'shortcuts-view',
 
-    // Shortcut display fallbacks
+    // Shortcut display fallbacks (descriptions resolved via i18n descriptionKey)
     SHORTCUT_COMMAND_FALLBACKS: [
         {
             name: 'volume-up',
             shortcut: 'Alt+Shift+Up',
-            description: 'Увеличить громкость активной вкладки'
+            descriptionKey: 'shortcut.volumeUp'
         },
         {
             name: 'volume-down',
             shortcut: 'Alt+Shift+Down',
-            description: 'Уменьшить громкость активной вкладки'
+            descriptionKey: 'shortcut.volumeDown'
         },
         {
             name: 'volume-reset',
             shortcut: 'Alt+Shift+R',
-            description: 'Сбросить громкость активной вкладки'
+            descriptionKey: 'shortcut.volumeReset'
         },
         {
             name: 'toggle-mute',
             shortcut: 'Alt+Shift+M',
-            description: 'Включить или выключить звук активной вкладки'
+            descriptionKey: 'shortcut.toggleMute'
         },
         {
             name: 'toggle-compressor',
             shortcut: 'Alt+Shift+C',
-            description: 'Включить или выключить компрессор на активной вкладке'
+            descriptionKey: 'shortcut.toggleCompressor'
         }
     ]
 };
@@ -95,20 +96,73 @@ window.Popup.Utils = {
     },
     
     /**
-     * Check if a string contains only digits
-     * @param {string} str - String to test
-     * @returns {boolean}
-     */
-    isDigitsOnly: function(str) {
-        return /^\d*$/.test(str);
-    },
-    
-    /**
      * Sanitize volume input string - remove non-digit characters
      * @param {string} str - Input string
      * @returns {string} - Sanitized string with only digits
      */
     sanitizeVolumeInput: function(str) {
         return PopupProtocol.sanitizeVolumeInput(str);
+    },
+
+    /**
+     * Step a volume text/number field by 1%. Empty or invalid input is treated as 0.
+     * Used by the main popup field and Other Tabs inline editor (mouse wheel and arrows).
+     * @param {HTMLInputElement} input
+     * @param {number} direction - positive increases, negative decreases
+     * @returns {boolean} whether the field value was written
+     */
+    nudgeVolumeInput: function(input, direction) {
+        if (!input || input.disabled) {
+            return false;
+        }
+        const min = window.Popup.Constants.MIN_VOLUME;
+        const max = window.Popup.Constants.MAX_VOLUME;
+        const currentVal = parseInt(input.value, 10) || 0;
+        const step = direction < 0 ? -1 : 1;
+        const newVal = Math.max(min, Math.min(max, currentVal + step));
+        input.value = String(newVal);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+    },
+
+    /**
+     * One-percent mouse-wheel step, only while the field itself is focused
+     * (clicked or tabbed into). Hover alone never steps, so scrolling the
+     * popup list over the field keeps scrolling. A zero deltaY is ignored.
+     * @param {WheelEvent} event
+     * @param {HTMLInputElement} input
+     * @returns {boolean} whether a step was applied
+     */
+    handleVolumeInputWheel: function(event, input) {
+        if (!event || !event.deltaY) {
+            return false;
+        }
+        if (typeof document !== 'undefined' && document) {
+            const focused = document.activeElement;
+            if (focused != null && focused !== input) {
+                return false;
+            }
+        }
+        if (typeof event.preventDefault === 'function') {
+            event.preventDefault();
+        }
+        if (typeof event.stopPropagation === 'function') {
+            event.stopPropagation();
+        }
+        return this.nudgeVolumeInput(input, event.deltaY < 0 ? 1 : -1);
+    },
+
+    /**
+     * Bind the shared non-passive wheel listener to a volume field.
+     * @param {HTMLInputElement} input
+     */
+    bindVolumeInputWheel: function(input) {
+        if (!input || typeof input.addEventListener !== 'function') {
+            return;
+        }
+        const self = this;
+        input.addEventListener('wheel', (event) => {
+            self.handleVolumeInputWheel(event, input);
+        }, { passive: false });
     }
 };

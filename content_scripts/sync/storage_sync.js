@@ -3,7 +3,6 @@
  */
 
 window.VolumeControl = window.VolumeControl || {};
-window.VolumeControl.StorageSync = {};
 
 (function() {
     const { log, warn, verbose } = window.VolumeControl;
@@ -125,6 +124,13 @@ window.VolumeControl.StorageSync = {};
          */
         saveVolume(volume) {
             this.scheduleWrite(SESSION_STORAGE_KEY_VOLUME, volume.toString());
+        }
+
+        scheduleVolumePersist(volume, options = {}) {
+            this.scheduleWrite(SESSION_STORAGE_KEY_VOLUME, volume.toString());
+            if (options.immediate) {
+                this.flushWrites();
+            }
         }
 
         /**
@@ -297,11 +303,12 @@ window.VolumeControl.StorageSync = {};
             state.currentCompressionRatio = settings.compressionRatio;
             state.currentCompressionKnee = settings.compressionKnee;
 
-            // If volume was loaded from storage (different from default), mark it as set
-            // This prevents adopting player volume on first element setup
+            // Volume ownership is established by VolumeOwnership after background hydration.
             if (settings.volumeWasStored) {
-                state.volumeHasBeenSet = true;
-                log('[StorageSync] Volume was stored, marking as set');
+                state.__legacyRestoredVolume = settings.volume;
+                log('[StorageSync] Legacy restored volume pending canonical hydration');
+            } else if (!state.volumeHasBeenSet) {
+                state.volumeOwnership = 'unowned';
             }
 
             if (settings.monoWasStored) {
