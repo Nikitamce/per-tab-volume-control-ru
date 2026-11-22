@@ -209,6 +209,21 @@
       </section>
 
       <section class="settings-group">
+        <p class="settings-group-title" data-i18n="popup.settings.group.site">This Site</p>
+
+        <div class="settings-row settings-row-with-switch">
+          <span class="settings-row-copy">
+            <span class="settings-row-label" data-i18n="popup.settings.siteEnabled.label">Enable on this site</span>
+            <span class="settings-row-subtitle" id="settings-site-enabled-subtitle" data-i18n="popup.settings.siteEnabled.unavailable">(Unavailable on this page)</span>
+          </span>
+          <label class="switch settings-switch" for="settings-site-enabled-toggle" title="Turn extension sound control on or off for this site" data-i18n-title="popup.settings.siteEnabled.title">
+            <input type="checkbox" id="settings-site-enabled-toggle" data-global-control="true">
+            <span class="toggle-slider round"></span>
+          </label>
+        </div>
+      </section>
+
+      <section class="settings-group">
         <p class="settings-group-title" data-i18n="popup.settings.group.global">Global Settings</p>
 
         <div class="settings-row settings-row-with-switch">

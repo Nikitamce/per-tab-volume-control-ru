@@ -67,6 +67,9 @@
             apply(originalSet, this, [value]);
 
             try {
+                if (this instanceof window.HTMLAudioElement && !this.isConnected) {
+                    return;
+                }
                 if (apply(originalGet, this, []) !== before) {
                     apply(dispatchEvent, document, [new EventCtor(VOLUME_HOOK_EVENT, { detail: this })]);
                 }

@@ -236,6 +236,10 @@ window.VolumeControl.Main = {};
 
     function applyVolumeToOtherElements(sourceElement, volume, options = {}) {
         const fromPlayer = options.fromPlayer === true;
+        // Never mirror a player's own volume change onto other media elements on the page.
+        if (fromPlayer) {
+            return;
+        }
         const VolumeSyncManager = getVolumeSyncManager();
         const VolumeController = getVolumeController();
         const stateManager = getElementStateManager();
@@ -1876,6 +1880,10 @@ window.VolumeControl.Main = {};
         // A temporary-source retry owns the retry scope once it is scheduled, and runs without the flag.
         const retryOptions = { ...options, preserveRetryScope: false };
         const elementInfo = `${element.tagName}#${element.id || 'no-id'}`;
+        if (element instanceof HTMLAudioElement && !element.isConnected) {
+            verbose(`[Main] ${elementInfo} is off-DOM <audio>, skipping setup`);
+            return null;
+        }
         
         ensureElementState();
         const stateManager = getElementStateManager();
@@ -3121,6 +3129,10 @@ window.VolumeControl.Main = {};
      */
     function handleElementDiscovered(element, source) {
         const elementInfo = `${element.tagName}#${element.id || 'no-id'}`;
+        if (element instanceof HTMLAudioElement && !element.isConnected) {
+            verbose(`[Main] ${elementInfo} is off-DOM <audio>, ignoring discovery (${source})`);
+            return;
+        }
         verbose(`[Main] Element discovered: ${elementInfo} (via ${source})`);
 
         pruneStaleNativeOnlyEntries();

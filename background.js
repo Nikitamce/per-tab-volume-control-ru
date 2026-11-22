@@ -1453,17 +1453,60 @@ async function setExtensionEnabledForTab(tabId, enabled) {
     }
 }
 
+async function getStoredExtensionEnablePreferences() {
+    const stored = await browser.storage.local.get([
+        PreferenceKeys.EXTENSION_ENABLED,
+        PreferenceKeys.DISABLED_SITES
+    ]);
+    return Protocol.normalizeExtensionPreferences(stored);
+}
+
 async function setGlobalExtensionEnabled(enabled) {
     const nextEnabled = enabled !== false;
+    const preferences = await getStoredExtensionEnablePreferences();
     const tabs = await browser.tabs.query({});
 
     await Promise.allSettled(
         tabs
             .filter((tab) => tab?.id)
-            .map((tab) => setExtensionEnabledForTab(tab.id, nextEnabled))
+            .map((tab) => {
+                const effective = nextEnabled && !Protocol.isSiteDisabled(tab.url, preferences.disabledSites);
+                return setExtensionEnabledForTab(tab.id, effective);
+            })
     );
 
     return { success: true };
+}
+
+async function setSiteExtensionEnabled(siteKey, enabled) {
+    const normalizedKey = String(siteKey || '').trim().toLowerCase();
+    if (!normalizedKey) {
+        return { success: false, error: 'Missing siteKey' };
+    }
+
+    const nextSiteEnabled = enabled !== false;
+    const preferences = await getStoredExtensionEnablePreferences();
+    const nextDisabledSet = new Set(preferences.disabledSites);
+    if (nextSiteEnabled) {
+        nextDisabledSet.delete(normalizedKey);
+    } else {
+        nextDisabledSet.add(normalizedKey);
+    }
+    const nextDisabledSites = Protocol.normalizeDisabledSites(Array.from(nextDisabledSet));
+
+    await browser.storage.local.set({
+        [PreferenceKeys.DISABLED_SITES]: nextDisabledSites
+    });
+
+    const effectiveForSite = preferences.extensionEnabled !== false && nextSiteEnabled;
+    const tabs = await browser.tabs.query({});
+    await Promise.allSettled(
+        tabs
+            .filter((tab) => tab?.id && Protocol.getSiteKeyFromUrl(tab.url) === normalizedKey)
+            .map((tab) => setExtensionEnabledForTab(tab.id, effectiveForSite))
+    );
+
+    return { success: true, disabledSites: nextDisabledSites };
 }
 
 async function setGlobalBalance(settings) {
@@ -2084,6 +2127,18 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
     }
 
+    if (message.type === Messages.SET_SITE_EXTENSION_ENABLED) {
+        if (isContentScriptSender(sender)) {
+            return;
+        }
+        const siteKey = message.payload?.siteKey;
+        const enabled = message.payload?.enabled !== false;
+        return respondAsync(sendResponse, 'SET_SITE_EXTENSION_ENABLED', async () => {
+            await ensureTabStateRestored();
+            return setSiteExtensionEnabled(siteKey, enabled);
+        });
+    }
+
     if (message.type === Messages.SET_GLOBAL_BALANCE) {
         if (isContentScriptSender(sender)) {
             return;
@@ -2185,6 +2240,13 @@ async function handleTabUpdated(tabId, changeInfo, tab) {
     if (changeInfo.status === 'loading') {
         clearCachedFrameStatusPayloads(tabId);
 
+        const enablePrefs = await getStoredExtensionEnablePreferences().catch(() => ({
+            extensionEnabled: true,
+            disabledSites: []
+        }));
+        const shouldBeEnabled = enablePrefs.extensionEnabled !== false &&
+            !Protocol.isSiteDisabled(tab?.url, enablePrefs.disabledSites);
+
         // Navigation can temporarily silence content scripts; keep last-known per-tab settings
         // so the toolbar icon doesn't incorrectly snap to 100%.
         const prev = tabState.get(tabId) || { volume: CONSTANTS.DEFAULT_VOLUME, corsAffectedCount: 0 };
@@ -2194,6 +2256,7 @@ async function handleTabUpdated(tabId, changeInfo, tab) {
             favIconUrl: tab?.favIconUrl || prev.favIconUrl || '',
             url: tab?.url || prev.url || '',
             windowId: tab?.windowId,
+            extensionEnabled: shouldBeEnabled,
             status: prev.status || 'no-media',
             hasMedia: prev.hasMedia === true,
             lastSeenAt: Date.now()

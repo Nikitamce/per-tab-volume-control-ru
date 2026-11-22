@@ -568,13 +568,16 @@ window.VolumeControl = window.VolumeControl || {};
             // flag defaults to true, so an enabled preference is a no-op there and element
             // recovery still does not start before init has hydrated. A runtime command that
             // already arrived wins over the stored value (it is the newer of the two).
+            const siteDisabled = Protocol.isSiteDisabled(window.location.href, preferences.disabledSites);
+            const effectiveExtensionEnabled = resolvedPageState.extensionEnabled !== false && !siteDisabled;
+
             const Main = getMain();
             if (runtimeExtensionEnabled !== null) {
                 verbose('[Preferences] A runtime extension toggle arrived during init; keeping it');
             } else if (typeof Main?.setExtensionEnabled === 'function') {
-                Main.setExtensionEnabled(resolvedPageState.extensionEnabled);
+                Main.setExtensionEnabled(effectiveExtensionEnabled);
             } else {
-                State.extensionEnabled = resolvedPageState.extensionEnabled;
+                State.extensionEnabled = effectiveExtensionEnabled;
             }
         } catch (e) {
             warn('[Preferences] Failed to load extension preferences:', e);
@@ -643,17 +646,32 @@ window.VolumeControl = window.VolumeControl || {};
                 stateManager.cleanupAll();
             }
             
-            // Close shared AudioContext
-            if (State.sharedAudioContext && State.sharedAudioContext.state !== 'closed') {
-                State.sharedAudioContext.close().catch(e => {
-                    const isDeadObject = !e || 
-                                        String(e).includes('DeadObject') || 
-                                        String(e).includes('dead object');
-                    if (!isDeadObject) {
+            // Close shared AudioContext safely (ignore DeadObject and navigation teardown errors)
+            const sharedCtx = State.sharedAudioContext;
+            State.sharedAudioContext = null;
+            if (sharedCtx) {
+                const isExpectedCloseError = (e) => {
+                    if (!e) return true;
+                    const msg = String(e?.message || e);
+                    return msg.includes('DeadObject') ||
+                        msg.includes('dead object') ||
+                        msg.includes('Navigated away from page') ||
+                        e?.name === 'InvalidStateError' ||
+                        (typeof DOMException !== 'undefined' && e instanceof DOMException);
+                };
+                try {
+                    if (sharedCtx.state !== 'closed') {
+                        Promise.resolve(sharedCtx.close()).catch((e) => {
+                            if (!isExpectedCloseError(e)) {
+                                error("Error closing AudioContext:", e);
+                            }
+                        });
+                    }
+                } catch (e) {
+                    if (!isExpectedCloseError(e)) {
                         error("Error closing AudioContext:", e);
                     }
-                });
-                State.sharedAudioContext = null;
+                }
             }
             
             log("Cleanup complete.");

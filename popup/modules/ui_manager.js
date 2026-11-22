@@ -58,6 +58,8 @@ window.Popup.UIManager = {
         this.uiElements.shortcutsBackButton = document.getElementById('shortcuts-back-button');
         this.uiElements.openShortcutsButton = document.getElementById('open-shortcuts-button');
         this.uiElements.settingsLanguageSelect = document.getElementById('settings-language-select');
+        this.uiElements.settingsSiteEnabledToggle = document.getElementById('settings-site-enabled-toggle');
+        this.uiElements.settingsSiteEnabledSubtitle = document.getElementById('settings-site-enabled-subtitle');
         this.uiElements.settingsExtensionEnabledToggle = document.getElementById('settings-extension-enabled-toggle');
         this.uiElements.settingsDefaultCompressionToggle = document.getElementById('settings-default-compression-toggle');
         this.uiElements.settingsDefaultMonoToggle = document.getElementById('settings-default-mono-toggle');
@@ -125,9 +127,26 @@ window.Popup.UIManager = {
         }
     },
 
-    updateSettingsPreferencesUI: function(preferences) {
+    updateSettingsPreferencesUI: function(preferences, currentSiteKey = this.lastSiteKey || '') {
         if (!preferences) {
             return;
+        }
+
+        this.lastSiteKey = currentSiteKey || '';
+
+        if (this.uiElements.settingsSiteEnabledToggle) {
+            const hasSite = Boolean(this.lastSiteKey);
+            const globalEnabled = preferences.extensionEnabled !== false;
+            const siteDisabled = hasSite && Boolean(
+                globalThis.VCProtocol?.isSiteDisabled?.(this.lastSiteKey, preferences.disabledSites)
+            );
+            this.uiElements.settingsSiteEnabledToggle.checked = hasSite && !siteDisabled;
+            this.uiElements.settingsSiteEnabledToggle.disabled = !hasSite || !globalEnabled;
+        }
+        if (this.uiElements.settingsSiteEnabledSubtitle) {
+            this.uiElements.settingsSiteEnabledSubtitle.textContent = this.lastSiteKey
+                ? `(${this.lastSiteKey})`
+                : this.t('popup.settings.siteEnabled.unavailable');
         }
 
         if (this.uiElements.settingsExtensionEnabledToggle) {

@@ -26,6 +26,7 @@ const {
 
 // --- State Variables ---
 let currentTabId = null;
+let currentTabSiteKey = '';
 let volumeSendThrottleTimer = null;
 let lastVolumeSendAt = 0;
 let pendingVolumeSend = null;
@@ -112,6 +113,7 @@ function flushAllDebouncedSends() {
 function buildPreferenceStoragePayload(preferences) {
     return {
         [PopupPreferenceKeys.EXTENSION_ENABLED]: preferences.extensionEnabled !== false,
+        [PopupPreferenceKeys.DISABLED_SITES]: Protocol.normalizeDisabledSites(preferences.disabledSites),
         [PopupPreferenceKeys.DEFAULT_COMPRESSION_ENABLED]: Boolean(preferences.defaultCompressionEnabled),
         [PopupPreferenceKeys.DEFAULT_MONO_ENABLED]: Boolean(preferences.defaultMonoEnabled),
         [PopupPreferenceKeys.DEFAULT_BALANCE_ENABLED]: Boolean(preferences.defaultBalanceEnabled),
@@ -129,6 +131,9 @@ function applyExtensionPreferencePatch(patch) {
     if (Object.prototype.hasOwnProperty.call(patch, 'extensionEnabled')) {
         nextPreferences.extensionEnabled = patch.extensionEnabled !== false;
     }
+    if (Object.prototype.hasOwnProperty.call(patch, 'disabledSites')) {
+        nextPreferences.disabledSites = Protocol.normalizeDisabledSites(patch.disabledSites);
+    }
     if (Object.prototype.hasOwnProperty.call(patch, 'defaultCompressionEnabled')) {
         nextPreferences.defaultCompressionEnabled = Boolean(patch.defaultCompressionEnabled);
     }
@@ -143,7 +148,7 @@ function applyExtensionPreferencePatch(patch) {
     }
 
     extensionPreferences = nextPreferences;
-    UIManager.updateSettingsPreferencesUI(extensionPreferences);
+    UIManager.updateSettingsPreferencesUI(extensionPreferences, currentTabSiteKey);
     syncMainControlsWithPreferences();
     return extensionPreferences;
 }
@@ -1050,6 +1055,45 @@ function handleDefaultBalancePreferenceChange(commitImmediately = false) {
     scheduleExtensionPreferenceSave({ defaultBalance: balance });
 }
 
+async function handleSiteEnabledPreferenceChange() {
+    if (!currentTabSiteKey) {
+        return;
+    }
+    const enabled = Boolean(UIManager.uiElements.settingsSiteEnabledToggle?.checked);
+
+    try {
+        const response = await browser.runtime.sendMessage({
+            type: PopupMessages.SET_SITE_EXTENSION_ENABLED,
+            payload: {
+                siteKey: currentTabSiteKey,
+                enabled
+            }
+        });
+
+        if (Array.isArray(response?.disabledSites)) {
+            applyExtensionPreferencePatch({ disabledSites: response.disabledSites });
+        }
+
+        if (!enabled) {
+            latestStatusSnapshot = {
+                ...latestStatusSnapshot,
+                status: 'disabled',
+                statusDetail: 'manual-disabled',
+                extensionEnabled: true
+            };
+            UIManager.updateUI(latestStatusSnapshot);
+            syncMainControlsWithPreferences();
+            return;
+        }
+
+        if (currentTabId) {
+            requestStatusFromContentScript(currentTabId, { forceProbe: true });
+        }
+    } catch (err) {
+        log('Failed to save site enabled preference:', err.message);
+    }
+}
+
 async function handleExtensionEnabledPreferenceChange() {
     const enabled = Boolean(UIManager.uiElements.settingsExtensionEnabledToggle?.checked);
 
@@ -1344,6 +1388,7 @@ function setupEventListeners() {
     UIManager.uiElements.shortcutsBackButton?.addEventListener('click', handleShortcutsBack);
     UIManager.uiElements.openShortcutsButton?.addEventListener('click', handleShortcutsOpen);
     UIManager.uiElements.settingsLanguageSelect?.addEventListener('change', handleLanguagePreferenceChange);
+    UIManager.uiElements.settingsSiteEnabledToggle?.addEventListener('change', handleSiteEnabledPreferenceChange);
     UIManager.uiElements.settingsExtensionEnabledToggle?.addEventListener('change', handleExtensionEnabledPreferenceChange);
     UIManager.uiElements.settingsDefaultCompressionToggle?.addEventListener('change', handleDefaultCompressionPreferenceChange);
     UIManager.uiElements.settingsDefaultMonoToggle?.addEventListener('change', handleDefaultMonoPreferenceChange);
@@ -1397,6 +1442,8 @@ async function init() {
     const activeTab = await getActiveTab();
     if (activeTab) {
         currentTabId = activeTab.id;
+        currentTabSiteKey = Protocol.getSiteKeyFromUrl(activeTab.url);
+        UIManager.updateSettingsPreferencesUI(extensionPreferences, currentTabSiteKey);
         requestStatusFromContentScript(currentTabId, { forceProbe: true });
     } else {
         log("Initialization failed: No suitable active tab found.");

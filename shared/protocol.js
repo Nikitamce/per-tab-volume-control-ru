@@ -20,6 +20,7 @@
 
     const PreferenceKeys = Object.freeze({
         EXTENSION_ENABLED: 'extensionEnabled',
+        DISABLED_SITES: 'disabledSites',
         DEFAULT_COMPRESSION_ENABLED: 'defaultCompressionEnabled',
         DEFAULT_MONO_ENABLED: 'defaultMonoEnabled',
         DEFAULT_BALANCE_ENABLED: 'defaultBalanceEnabled',
@@ -61,6 +62,7 @@
         SET_TAB_MUTE_STATE: 'SET_TAB_MUTE_STATE',
         SET_EXTENSION_ENABLED: 'SET_EXTENSION_ENABLED',
         SET_GLOBAL_EXTENSION_ENABLED: 'SET_GLOBAL_EXTENSION_ENABLED',
+        SET_SITE_EXTENSION_ENABLED: 'SET_SITE_EXTENSION_ENABLED',
         FOCUS_TAB: 'FOCUS_TAB',
         TAB_AUDIO_STATE_CHANGED: 'TAB_AUDIO_STATE_CHANGED'
     });
@@ -283,6 +285,52 @@
         return normalized;
     }
 
+    function getSiteKeyFromUrl(url) {
+        if (!url || typeof url !== 'string') {
+            return '';
+        }
+        try {
+            const parsed = new URL(url);
+            if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                return parsed.hostname.toLowerCase();
+            }
+            if (parsed.protocol === 'file:') {
+                return 'file:' + (parsed.pathname || '/');
+            }
+            return '';
+        } catch {
+            return '';
+        }
+    }
+
+    function normalizeDisabledSites(sites) {
+        if (!Array.isArray(sites)) {
+            return [];
+        }
+        const unique = new Set();
+        for (const item of sites) {
+            if (typeof item !== 'string') continue;
+            const trimmed = item.trim().toLowerCase();
+            if (trimmed) {
+                unique.add(trimmed);
+            }
+        }
+        return Array.from(unique).sort();
+    }
+
+    function isSiteDisabled(urlOrSiteKey, disabledSites) {
+        if (!Array.isArray(disabledSites) || disabledSites.length === 0) {
+            return false;
+        }
+        const key = (typeof urlOrSiteKey === 'string' && urlOrSiteKey.includes('://'))
+            ? getSiteKeyFromUrl(urlOrSiteKey)
+            : String(urlOrSiteKey || '').trim().toLowerCase();
+        if (!key) {
+            return false;
+        }
+        return disabledSites.includes(key);
+    }
+
     function normalizeExtensionPreferences(settings) {
         const source = settings && typeof settings === 'object' ? settings : {};
 
@@ -290,6 +338,7 @@
             extensionEnabled: typeof source[PreferenceKeys.EXTENSION_ENABLED] === 'boolean'
                 ? source[PreferenceKeys.EXTENSION_ENABLED]
                 : true,
+            disabledSites: normalizeDisabledSites(source[PreferenceKeys.DISABLED_SITES]),
             defaultCompressionEnabled: Boolean(source[PreferenceKeys.DEFAULT_COMPRESSION_ENABLED]),
             defaultMonoEnabled: Boolean(source[PreferenceKeys.DEFAULT_MONO_ENABLED]),
             defaultBalanceEnabled: Boolean(source[PreferenceKeys.DEFAULT_BALANCE_ENABLED]),
@@ -633,6 +682,9 @@
         parseVolumeCommandPayload,
         normalizeCompressionSettings,
         normalizeGlobalBalanceSettings,
+        getSiteKeyFromUrl,
+        normalizeDisabledSites,
+        isSiteDisabled,
         normalizeExtensionPreferences,
         resolveInitialPageState,
         normalizeAudioSettings,

@@ -80,12 +80,22 @@ window.VolumeControl.MediaDetector = {};
                     return;
                 }
                 // Pages can dispatch this event too: only ever act on a real media element.
-                if (!(element instanceof HTMLMediaElement) || this.isTracked(element)) {
+                // Ignore off-DOM <audio> elements (e.g. Web Audio players like VOT).
+                if (
+                    !(element instanceof HTMLMediaElement) ||
+                    (element instanceof HTMLAudioElement && !element.isConnected) ||
+                    this.isTracked(element)
+                ) {
                     return;
                 }
 
                 Promise.resolve().then(() => {
-                    if (this.isStarted && generation === this.startGeneration && !this.isTracked(element)) {
+                    if (
+                        this.isStarted &&
+                        generation === this.startGeneration &&
+                        !(element instanceof HTMLAudioElement && !element.isConnected) &&
+                        !this.isTracked(element)
+                    ) {
                         this.notifyDiscovered(element, 'play-interception');
                     }
                 }).catch((err) => {

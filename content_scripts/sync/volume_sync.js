@@ -1810,6 +1810,9 @@ window.VolumeControl.VolumeSyncManager = {};
          * @returns {boolean} - Whether the write is held (a mask is up, or a restore is queued)
          */
         holdPageVolumeWrite(element) {
+            if (!element || (element instanceof HTMLAudioElement && !element.isConnected)) {
+                return false;
+            }
             const State = window.VolumeControl.State;
             const contextData = this.getPageWriteHoldContext(element);
             if (!contextData) {

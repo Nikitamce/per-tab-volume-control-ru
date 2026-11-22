@@ -41,6 +41,10 @@
         play() {
             const result = apply(originalPlay, this, []);
             try {
+                // Ignore off-DOM <audio> elements (e.g. Web Audio / translation scripts like VOT).
+                if (this instanceof window.HTMLAudioElement && !this.isConnected) {
+                    return result;
+                }
                 apply(dispatchEvent, document, [new EventCtor(PLAY_HOOK_EVENT, { detail: this })]);
             } catch (err) {
                 // Discovery is best effort; it must never affect the page's own play() call.
